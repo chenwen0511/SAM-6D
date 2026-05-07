@@ -1,0 +1,33 @@
+mui@ubuntu-System-Product-Name:~$ curl "http://127.0.0.1:8000/health"
+{"status":"ok","root_dir":"/home/mui/projects/smt/SAM-6D/SAM-6D","env_dir":"/home/mui/.micromamba/envs/sam6d","cad_path":"/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/models/tray_180mm_centered_mesh_v2.ply","cad_exists":true,"output_root":"/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs","default_seg_backend":"yolo_seg","yolo_weights":"/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/yolo_runs/tray_seg/weights/best.pt","yolo_weights_exists":true}mui@ubuntu-System-Product-Name:~$
+mui@ubuntu-System-Product-Name:~$
+mui@ubuntu-System-Product-Name:~$
+mui@ubuntu-System-Product-Name:~$ curl -X POST "http://127.0.0.1:8000/infer" \
+  -F "rgb=@/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/rgb.png" \
+  -F "depth=@/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/depth.png" \
+  -F "camera=@/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/camera.json" \
+  -F "segmentor_model=sam" \
+  -F "det_score_thresh=0.3"
+{"score":0.8672866225242615,
+"xyz_mm":[-39.67422866821289,-42.124290466308594,418.56719970703125],
+"rotation_euler_zyx_rad":[-1.0479800707645823,-1.2273715248092116,2.596818143045228],
+"rotation_order":"zyx","pose_convention":"xyz is camera-frame translation in mm; rx, ry, rz are ZYX Euler angles in radians.",
+"xyzrxryrz":[-39.67422866821289,-42.124290466308594,418.56719970703125,-1.0479800707645823,-1.2273715248092116,2.596818143045228],
+"xyzrxryrz_unit":"mm_rad","result_dir":"/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_194839_79feda99",
+"detection_ism_path":"/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_194839_79feda99/sam6d_results/detection_ism.json",
+"detection_pem_path":"/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_194839_79feda99/sam6d_results/detection_pem.json",
+"vis_ism_path":"/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_194839_79feda99/sam6d_results/vis_ism.png",
+"vis_pem_path":"/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_194839_79feda99/sam6d_results/vis_pem.png",
+"all_detections":"/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_194839_79feda99/sam6d_results/detection_pem.json",
+"timing":
+
+{
+  "ism_s":null,
+  "yolo_s":0.1684631289972458,
+  "templates_s":7.770099909976125e-05,
+  "pose_s":4.143830660992535,
+  "pipeline_s":4.31237149098888,
+  "upload_s":0.000293968987534754,
+  "total_s":4.312665459976415}
+}
+
