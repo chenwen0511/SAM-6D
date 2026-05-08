@@ -206,3 +206,43 @@ echo "[PEM] exit_code: $RET"
 - `ln -s` 和 `python run_inference_custom.py` 必须使用同一个 `OUT` 变量。
 - 不要在 `--output_dir` 里再次写 `manual_run_$(date ...)`，否则会和建链接目录不一致。
 - 你的 `SEG` 来自 YOLO 后端时，建议 `--det_score_thresh 0.0`（与服务逻辑一致）。
+
+## 8) PEM 权重加载位置说明
+
+`Pose_Estimation_Model/run_inference_custom.py` 推理时会涉及两个 `.pth`：
+
+- 主权重：`Pose_Estimation_Model/checkpoints/sam-6d-pem-base.pth`
+- MAE 预训练权重：`Pose_Estimation_Model/checkpoints/mae_pretrain_vit_base.pth`
+
+### 8.1 主权重（显式加载）
+
+在 `Pose_Estimation_Model/run_inference_custom.py` 主流程中直接加载：
+
+```python
+checkpoint = os.path.join(os.path.dirname((os.path.abspath(__file__))), 'checkpoints', 'sam-6d-pem-base.pth')
+gorilla.solver.load_checkpoint(model=model, filename=checkpoint)
+```
+
+说明：这里是把 PEM 的训练权重加载到 `MODEL.Net(cfg.model)` 实例中。
+
+### 8.2 MAE 权重（模型初始化时隐式加载）
+
+`run_inference_custom.py` 在创建模型时会触发特征提取模块初始化：
+
+```python
+MODEL = importlib.import_module(cfg.model_name)
+model = MODEL.Net(cfg.model)
+```
+
+随后进入 `Pose_Estimation_Model/model/feature_extraction.py` 的 `ViT_AE.__init__`。
+当配置 `pretrained: True` 时，会在该处加载：
+
+```python
+vit_checkpoint = os.path.join('checkpoints', 'mae_pretrain_'+ self.vit_type +'.pth')
+checkpoint = torch.load(vit_checkpoint, map_location='cpu')
+msg = self.vit.load_state_dict(checkpoint_model, strict=False)
+```
+
+说明：默认配置 `vit_type: vit_base`，因此对应文件是 `mae_pretrain_vit_base.pth`。
+
+python warmup_http_service.py --host 0.0.0.0 --port 8001
