@@ -245,12 +245,13 @@ msg = self.vit.load_state_dict(checkpoint_model, strict=False)
 
 说明：默认配置 `vit_type: vit_base`，因此对应文件是 `mae_pretrain_vit_base.pth`。
 
-
+权重信息
+```
 (sam6d) mui@ubuntu-System-Product-Name:~/projects/smt/SAM-6D/SAM-6D/Pose_Estimation_Model/checkpoints$ ls -lh
 总计 1.6G
 -rw------- 1 mui mui 328M  4月 27 18:58 mae_pretrain_vit_base.pth
 -rw-rw-r-- 1 mui mui 1.3G  3月  1  2024 sam-6d-pem-base.pth
-
+```
 
 ## 9) Warm 方案改动与调用记录（2026-05-08）
 
@@ -302,3 +303,61 @@ curl -X POST "http://127.0.0.1:8001/infer" \
 
 - 本次 `pose_s` 降到约 `0.612s`，相较于之前记录的 `4.14s` 明显降低。
 - 当前返回中 `ism_s: null`、`yolo_s` 有值，说明此次分割后端走的是 YOLO 分支。
+
+### 9.7 Warm 服务启动与连续调用日志（2026-05-08）
+
+```bash
+(sam6d) mui@ubuntu-System-Product-Name:~/projects/smt/SAM-6D/SAM-6D$ python warmup_http_service.py
+=> [preload] auto start (default) flag=1 gpus=0
+set CUDA_VISIBLE_DEVICES as 0
+=> [preload] env
+   SAM6D_CUDA_VISIBLE_DEVICES=None
+   PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+=> [preload] config_path: /home/mui/projects/smt/SAM-6D/SAM-6D/Pose_Estimation_Model/config/base.yaml
+=> [preload] checkpoint_path: /home/mui/projects/smt/SAM-6D/SAM-6D/Pose_Estimation_Model/checkpoints/sam-6d-pem-base.pth
+=> [preload] cache_key: ('0', 'pose_estimation_model', '/home/mui/projects/smt/SAM-6D/SAM-6D/Pose_Estimation_Model/checkpoints/sam-6d-pem-base.pth', '/home/mui/projects/smt/SAM-6D/SAM-6D/Pose_Estimation_Model/config/base.yaml')
+=> [preload] torch info
+   torch_version=2.0.0+cu117
+   cuda_version=11.7
+   cuda_is_available=True
+   current_device=0
+   device_name=NVIDIA GeForce RTX 4090
+   mem_allocated_GiB=0.000
+   mem_reserved_GiB=0.000
+=> [preload] creating model (model=pose_estimation_model) ...
+=> [preload] importing model module ...
+load pre-trained checkpoint from: checkpoints/mae_pretrain_vit_base.pth
+=> [preload] loading checkpoint: /home/mui/projects/smt/SAM-6D/SAM-6D/Pose_Estimation_Model/checkpoints/sam-6d-pem-base.pth
+=> [preload] done. mem_allocated_GiB=0.402 mem_reserved_GiB=1.316
+INFO:     Started server process [738610]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8001 (Press CTRL+C to quit)
+INFO:     127.0.0.1:34308 - "GET /health HTTP/1.1" 200 OK
+/home/mui/.micromamba/envs/sam6d/lib/python3.9/site-packages/ultralytics/yolo/utils/checks.py:17: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources as pkg
+set CUDA_VISIBLE_DEVICES as 0
+INFO:     127.0.0.1:52150 - "POST /infer HTTP/1.1" 200 OK
+set CUDA_VISIBLE_DEVICES as 0
+INFO:     127.0.0.1:59418 - "POST /infer HTTP/1.1" 200 OK
+set CUDA_VISIBLE_DEVICES as 0
+INFO:     127.0.0.1:40234 - "POST /infer HTTP/1.1" 200 OK
+set CUDA_VISIBLE_DEVICES as 0
+INFO:     127.0.0.1:40250 - "POST /infer HTTP/1.1" 200 OK
+set CUDA_VISIBLE_DEVICES as 0
+INFO:     127.0.0.1:40260 - "POST /infer HTTP/1.1" 200 OK
+set CUDA_VISIBLE_DEVICES as 0
+INFO:     127.0.0.1:41580 - "POST /infer HTTP/1.1" 200 OK
+set CUDA_VISIBLE_DEVICES as 0
+INFO:     127.0.0.1:60650 - "POST /infer HTTP/1.1" 200 OK
+set CUDA_VISIBLE_DEVICES as 0
+INFO:     127.0.0.1:33862 - "POST /infer HTTP/1.1" 200 OK
+set CUDA_VISIBLE_DEVICES as 0
+INFO:     127.0.0.1:43008 - "POST /infer HTTP/1.1" 200 OK
+```
+
+日志解读：
+
+- 预加载已在服务启动阶段成功执行，且成功加载默认 PEM 主权重与 MAE 权重。
+- 预加载后显存常驻约：`allocated ~0.402 GiB`，`reserved ~1.316 GiB`。
+- 服务启动后多次 `/infer` 请求连续返回 `200 OK`，说明 warm 方案在当前环境下稳定可用。
