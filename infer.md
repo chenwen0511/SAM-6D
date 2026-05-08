@@ -245,4 +245,60 @@ msg = self.vit.load_state_dict(checkpoint_model, strict=False)
 
 说明：默认配置 `vit_type: vit_base`，因此对应文件是 `mae_pretrain_vit_base.pth`。
 
-python warmup_http_service.py --host 0.0.0.0 --port 8001
+
+(sam6d) mui@ubuntu-System-Product-Name:~/projects/smt/SAM-6D/SAM-6D/Pose_Estimation_Model/checkpoints$ ls -lh
+总计 1.6G
+-rw------- 1 mui mui 328M  4月 27 18:58 mae_pretrain_vit_base.pth
+-rw-rw-r-- 1 mui mui 1.3G  3月  1  2024 sam-6d-pem-base.pth
+
+
+## 9) Warm 方案改动与调用记录（2026-05-08）
+
+### 9.1 改动方案（Warm）
+
+- 新增 PEM 可导入接口脚本：`SAM-6D/Pose_Estimation_Model/run_warmup_inference_custom.py`
+  - 将原 CLI 推理流程封装成可被 HTTP 服务直接调用的函数。
+  - 支持默认模型/默认 checkpoint 的预加载与缓存复用（减少重复加载耗时）。
+  - 增加预加载日志（环境、路径、缓存命中、CUDA信息、异常阶段）。
+- `SAM-6D/warmup_http_service.py` 采用 warm 方式调用 PEM（不再每次都重新初始化完整 PEM 环境）。
+- 接口保持与原服务一致：`POST /infer` 的输入输出字段不变。
+
+### 9.2 本次调用命令
+
+```bash
+curl -X POST "http://127.0.0.1:8001/infer" \
+  -F "rgb=@/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/rgb.png" \
+  -F "depth=@/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/depth.png" \
+  -F "camera=@/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/camera.json" \
+  -F "segmentor_model=sam" \
+  -F "det_score_thresh=0.3"
+```
+
+### 9.3 返回结果（摘要）
+
+- score: `0.7004115581512451`
+- xyz_mm: `[-35.76496505737305, -50.191524505615234, 419.96319580078125]`
+- rotation_euler_zyx_rad: `[-2.113831981043488, 1.3517449756622901, -0.6791343908055002]`
+- xyzrxryrz(mm+rad): `[-35.76496505737305, -50.191524505615234, 419.96319580078125, -2.113831981043488, 1.3517449756622901, -0.6791343908055002]`
+
+### 9.4 输出目录与文件
+
+- result_dir: `/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260508_101743_b16ac733`
+- detection_ism_path: `/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260508_101743_b16ac733/sam6d_results/detection_ism.json`
+- detection_pem_path: `/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260508_101743_b16ac733/sam6d_results/detection_pem.json`
+- vis_ism_path: `/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260508_101743_b16ac733/sam6d_results/vis_ism.png`
+- vis_pem_path: `/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260508_101743_b16ac733/sam6d_results/vis_pem.png`
+
+### 9.5 耗时（秒）
+
+- upload_s: `0.00031983799999579787`
+- templates_s: `0.00028569900314323604`
+- yolo_s: `0.1617757609928958`
+- pose_s: `0.6119539139908738`
+- pipeline_s: `0.7740153739869129`
+- total_s: `0.7743352119869087`
+
+### 9.6 对比说明
+
+- 本次 `pose_s` 降到约 `0.612s`，相较于之前记录的 `4.14s` 明显降低。
+- 当前返回中 `ism_s: null`、`yolo_s` 有值，说明此次分割后端走的是 YOLO 分支。
