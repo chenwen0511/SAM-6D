@@ -58,6 +58,42 @@ PEM 并不是纯 CNN，包含：
 建议脚本化压测，至少 30 次请求，保存为 `baseline.csv`。  
 后续 TRT 结果必须与这个基线对比。
 
+### 3.1 使用 `trt/baseline.py` 做函数级基线
+
+仓库已提供：
+
+- 脚本：`Pose_Estimation_Model/trt/baseline.py`
+- 输出：`Pose_Estimation_Model/trt/baseline.csv`
+
+该脚本特点：
+
+- 直接 import `run_warmup_inference_custom.py` 的 `run_pose_inference`；
+- 使用 `preload_default_pem_model` 先做模型预加载；
+- 先执行若干次 warmup（默认 5 次），再进行 benchmark（默认 30 次）；
+- 使用 `time.perf_counter_ns()` 纳秒级计时；
+- CSV 同时写入汇总指标（mean/median/p95/min/max/std）和每次样本时延。
+
+示例：
+
+```bash
+cd /home/mui/projects/smt/SAM-6D/SAM-6D/Pose_Estimation_Model/trt
+
+python baseline.py \
+  --output_dir /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260508_101743_b16ac733 \
+  --cad_path /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/models/tray_180mm_centered_mesh_v2.ply \
+  --rgb_path /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/rgb.png \
+  --depth_path /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/depth.png \
+  --cam_path /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/camera.json \
+  --seg_path /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260508_101743_b16ac733/sam6d_results/detection_ism.json \
+  --det_score_thresh 0.0 \
+  --gpus 0 \
+  --warmup_runs 5 \
+  --benchmark_runs 30 \
+  --csv_path /home/mui/projects/smt/SAM-6D/SAM-6D/Pose_Estimation_Model/trt/baseline.csv
+```
+
+建议固定输入与环境变量后再跑，确保 TRT 前后对比公平。
+
 ---
 
 ## 4. 选择 TRT 目标子模块

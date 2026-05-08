@@ -361,3 +361,42 @@ INFO:     127.0.0.1:43008 - "POST /infer HTTP/1.1" 200 OK
 - 预加载已在服务启动阶段成功执行，且成功加载默认 PEM 主权重与 MAE 权重。
 - 预加载后显存常驻约：`allocated ~0.402 GiB`，`reserved ~1.316 GiB`。
 - 服务启动后多次 `/infer` 请求连续返回 `200 OK`，说明 warm 方案在当前环境下稳定可用。
+
+### 9.8 显存占用快照（nvidia-smi，2026-05-08 16:19:12）
+
+```text
+Every 1.0s: nvidia-smi                                                                                                              ubuntu-System-Product-Name: Fri May  8 16:19:12 2026
+
+Fri May  8 16:19:12 2026
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 590.48.01              Driver Version: 590.48.01      CUDA Version: 13.1     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 4090        Off |   00000000:01:00.0 Off |                  Off |
+| 30%   33C    P8             19W /  450W |    4725MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A            2504      G   /usr/lib/xorg/Xorg                      208MiB |
+|    0   N/A  N/A            2723      G   /usr/bin/gnome-shell                     14MiB |
+|    0   N/A  N/A            3122      G   /usr/libexec/gnome-initial-setup          6MiB |
+|    0   N/A  N/A          339040      C   ...romamba/envs/sam6d/bin/python        740MiB |
+|    0   N/A  N/A          738610      C   python                                 3680MiB |
++-----------------------------------------------------------------------------------------+
+```
+
+解读：
+
+- 设备：RTX 4090，总显存约 `24 GiB`。
+- 采样时总占用约 `4.7 GiB`，其中主要由两个计算进程占用：
+  - `PID 738610`（warmup_http_service 进程）：约 `3.59 GB`
+  - `PID 339040`（另一个 sam6d python 进程）：约 `0.72 GB`
+- 当时 `GPU-Util=0%`，说明采样瞬间处于空闲窗口（非持续满载）。
