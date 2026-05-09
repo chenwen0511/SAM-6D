@@ -73,6 +73,47 @@ async def _startup_preload_yolo() -> None:
         print(f"[warmup_http_service] startup preload YOLO failed: {type(exc).__name__}: {exc}")
 
 
+@app.on_event("startup")
+async def _startup_preload_pem_templates_gpu() -> None:
+    """Load CAD templates from disk into GPU tensors once; run_pose_inference reuses the cache."""
+    flag = os.environ.get("SAM6D_PEM_PRELOAD_TEMPLATES", "1").strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        print("[warmup_http_service] PEM template GPU preload skipped: SAM6D_PEM_PRELOAD_TEMPLATES=0")
+        return
+
+    cad_env = os.environ.get("SAM6D_CAD_PATH")
+    if not cad_env:
+        print("[warmup_http_service] PEM template GPU preload skipped: SAM6D_CAD_PATH is not set")
+        return
+
+    cad_path = Path(cad_env).expanduser().resolve()
+    if not cad_path.is_file():
+        print(f"[warmup_http_service] PEM template GPU preload skipped: CAD not found: {cad_path}")
+        return
+
+    try:
+        templates_dir = _ensure_templates(cad_path)
+        from run_warmup_inference_custom import preload_pem_templates_gpu_cache
+
+        gpu_ids = os.environ.get("SAM6D_CUDA_VISIBLE_DEVICES", "0")
+        pem_cfg = os.environ.get("SAM6D_PEM_CONFIG_PATH")
+        rd_env = os.environ.get("SAM6D_RD_SEED")
+        kwargs: Dict[str, Any] = {"tem_path": str(templates_dir), "gpus": gpu_ids, "verbose": True}
+        if pem_cfg:
+            kwargs["config_path"] = pem_cfg
+        if rd_env is not None and rd_env.strip() != "":
+            kwargs["rd_seed"] = int(rd_env.strip())
+
+        print(
+            "[warmup_http_service] PEM template GPU preload begin: "
+            f"templates_dir={templates_dir} gpus={gpu_ids}"
+        )
+        preload_pem_templates_gpu_cache(**kwargs)
+        print("[warmup_http_service] PEM template GPU preload done")
+    except Exception as exc:
+        print(f"[warmup_http_service] PEM template GPU preload failed: {type(exc).__name__}: {exc}")
+
+
 def _env() -> Dict[str, str]:
     env = os.environ.copy()
     env.setdefault("MAMBA_ROOT_PREFIX", "/home/mui/.micromamba")
@@ -279,7 +320,7 @@ def _run_sam6d_pipeline(
 
     t_pose = time.perf_counter()
     gpu_ids = os.environ.get("SAM6D_CUDA_VISIBLE_DEVICES", "0")
-    pem_verbose = os.environ.get("SAM6D_PEM_VERBOSE", "").lower() in {"1", "true", "yes"}
+    pem_verbose = os.environ.get("SAM6D_PEM_VERBOSE", "true").lower() in {"1", "true", "yes"}
     run_pose_inference(
         output_dir,
         cad_path,
@@ -290,6 +331,7 @@ def _run_sam6d_pipeline(
         det_score_thresh=float(pem_det_score_thresh),
         gpus=gpu_ids,
         verbose=pem_verbose,
+        save_visualization=False,
     )
     timing["pose_s"] = time.perf_counter() - t_pose
 

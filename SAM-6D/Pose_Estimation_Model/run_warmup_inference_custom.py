@@ -3,7 +3,7 @@ import argparse
 import os
 import sys
 from contextlib import contextmanager
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 from PIL import Image
 import os.path as osp
@@ -15,6 +15,7 @@ import json
 import torch
 import torchvision.transforms as transforms
 import cv2
+import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.join(BASE_DIR, '..', 'Pose_Estimation_Model')
@@ -30,6 +31,9 @@ _DEFAULT_CHECKPOINT_PATH = osp.join(BASE_DIR, "checkpoints", "sam-6d-pem-base.pt
 # Cache the default model for optional preloading / fast subsequent calls.
 _CACHED_DEFAULT_MODEL = None
 _CACHED_DEFAULT_MODEL_KEY: Optional[tuple] = None
+
+# Populated by preload_pem_templates_gpu_cache(); reused in run_pose_inference when keys match.
+_GET_TEMPLATES_GPU_CACHE: Dict[str, Tuple[list, list, list]] = {}
 
 
 @contextmanager
@@ -351,6 +355,71 @@ def get_templates(path, cfg):
     return all_tem, all_tem_pts, all_tem_choose
 
 
+def _pem_templates_cache_key(tem_path: str, test_ds: Any, rd_seed: int) -> str:
+    """Stable key: resolved template dir + params that affect get_templates sampling/output."""
+    rp = osp.realpath(tem_path)
+    return "|".join(
+        (
+            rp,
+            str(int(rd_seed)),
+            str(int(test_ds.n_template_view)),
+            str(int(test_ds.img_size)),
+            str(int(test_ds.n_sample_template_point)),
+            str(bool(test_ds.rgb_mask_flag)),
+        )
+    )
+
+
+def preload_pem_templates_gpu_cache(
+    tem_path: Union[str, os.PathLike],
+    *,
+    gpus: str = "0",
+    config_path: Optional[str] = None,
+    rd_seed: Optional[int] = None,
+    verbose: bool = True,
+) -> str:
+    """
+    Run ``get_templates`` once at process startup and cache GPU tensors.
+
+    ``run_pose_inference`` hits this cache when ``realpath(output_dir/templates)``,
+    ``cfg.rd_seed``, and ``test_dataset`` fields used below match.
+
+    Call after ``SAM6D_CUDA_VISIBLE_DEVICES`` / ``gpus`` are set consistently with inference.
+    """
+    global _GET_TEMPLATES_GPU_CACHE
+
+    tem_path = osp.realpath(os.fspath(tem_path))
+    if config_path is None:
+        resolved_config = _DEFAULT_CONFIG_PATH
+    else:
+        resolved_config = osp.abspath(os.fspath(config_path))
+
+    cfg = gorilla.Config.fromfile(resolved_config)
+    seed = int(rd_seed) if rd_seed is not None else int(getattr(cfg, "rd_seed", 1))
+
+    gorilla.utils.set_cuda_visible_devices(gpu_ids=gpus)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    cache_key = _pem_templates_cache_key(tem_path, cfg.test_dataset, seed)
+    if cache_key in _GET_TEMPLATES_GPU_CACHE:
+        if verbose:
+            print(f"=> [preload templates] skip (cache hit): {cache_key[:140]}...")
+        return cache_key
+
+    t0 = time.perf_counter()
+    with _cwd(BASE_DIR):
+        packs = get_templates(tem_path, cfg.test_dataset)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    _GET_TEMPLATES_GPU_CACHE[cache_key] = packs
+    if verbose:
+        print(f"=> [preload templates] done elapsed_ms={elapsed_ms:.3f} cache_key[:96]={cache_key[:96]}...")
+    return cache_key
+
+
 def get_test_data(rgb_path, depth_path, cam_path, cad_path, seg_path, det_score_thresh, cfg):
     dets = []
     with open(seg_path) as f:
@@ -544,13 +613,29 @@ def run_pose_inference(
 
         _log("=> extracting templates ...")
         tem_path = osp.join(cfg.output_dir, "templates")
-        all_tem, all_tem_pts, all_tem_choose = get_templates(tem_path, cfg.test_dataset)
+        tem_cache_key = _pem_templates_cache_key(
+            tem_path, cfg.test_dataset, int(getattr(cfg, "rd_seed", 1))
+        )
+        cached_templates = _GET_TEMPLATES_GPU_CACHE.get(tem_cache_key)
+        t_tem0 = time.perf_counter()
+        if cached_templates is not None:
+            all_tem, all_tem_pts, all_tem_choose = cached_templates
+            _log("=> get_templates (gpu cache hit, skipped disk reload)")
+        else:
+            all_tem, all_tem_pts, all_tem_choose = get_templates(tem_path, cfg.test_dataset)
+        t_tem1 = time.perf_counter()
+        _log(f"=> get_templates elapsed_ms={(t_tem1 - t_tem0) * 1000.0:.3f}")
+
         with torch.no_grad():
+            t_feat0 = time.perf_counter()
             all_tem_pts, all_tem_feat = model.feature_extraction.get_obj_feats(
                 all_tem, all_tem_pts, all_tem_choose
             )
+            t_feat1 = time.perf_counter()
+            _log(f"=> template feature_extraction.get_obj_feats elapsed_ms={(t_feat1 - t_feat0) * 1000.0:.3f}")
 
         _log("=> loading input data ...")
+        t_td0 = time.perf_counter()
         input_data, img, _whole_pts, model_points, detections = get_test_data(
             cfg.rgb_path,
             cfg.depth_path,
@@ -560,6 +645,9 @@ def run_pose_inference(
             cfg.det_score_thresh,
             cfg.test_dataset,
         )
+        t_td1 = time.perf_counter()
+        _log(f"=> get_test_data elapsed_ms={(t_td1 - t_td0) * 1000.0:.3f}")
+
         ninstance = input_data["pts"].size(0)
         if ninstance == 0:
             raise RuntimeError(
@@ -569,9 +657,12 @@ def run_pose_inference(
 
         _log("=> running model ...")
         with torch.no_grad():
+            t_infer0 = time.perf_counter()
             input_data["dense_po"] = all_tem_pts.repeat(ninstance, 1, 1)
             input_data["dense_fo"] = all_tem_feat.repeat(ninstance, 1, 1)
             out = model(input_data)
+            t_infer1 = time.perf_counter()
+            _log(f"=> model.forward elapsed_ms={(t_infer1 - t_infer0) * 1000.0:.3f}")
 
     if "pred_pose_score" in out.keys():
         pose_scores = out["pred_pose_score"] * out["score"]
@@ -596,6 +687,7 @@ def run_pose_inference(
     if save_visualization:
         _log("=> visualizating ...")
         vis_path = osp.join(f"{cfg.output_dir}/sam6d_results", "vis_pem.png")
+        t_vis0 = time.perf_counter()
         valid_masks = pose_scores_np == pose_scores_np.max()
         K = input_data["K"].detach().cpu().numpy()[valid_masks]
         vis_img = visualize(
@@ -607,6 +699,8 @@ def run_pose_inference(
             vis_path,
         )
         vis_img.save(vis_path)
+        t_vis1 = time.perf_counter()
+        _log(f"=> visualize elapsed_ms={(t_vis1 - t_vis0) * 1000.0:.3f}")
 
     best_idx = int(np.argmax(pose_scores_np))
     return {
