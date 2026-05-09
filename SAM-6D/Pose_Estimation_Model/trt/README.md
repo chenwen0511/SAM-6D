@@ -55,7 +55,7 @@ PEM 并不是纯 CNN，包含：
 - `pose_s` 均值 / P95
 - GPU 利用率与显存
 
-建议脚本化压测，至少 30 次请求，保存为 `baseline.csv`。  
+建议脚本化压测，至少 30 次请求，保存为 `baseline.csv`；同时保留同一次运行生成的 `baseline_results.json`，便于与 TRT 对齐 **score** 与 **xyzrxryrz**。  
 后续 TRT 结果必须与这个基线对比。
 
 ### 3.1 使用 `trt/baseline.py` 做函数级基线
@@ -63,7 +63,9 @@ PEM 并不是纯 CNN，包含：
 仓库已提供：
 
 - 脚本：`Pose_Estimation_Model/trt/baseline.py`
-- 输出：`Pose_Estimation_Model/trt/baseline.csv`
+- 输出：
+  - `Pose_Estimation_Model/trt/baseline.csv`：汇总时延 + 每次运行的 `latency_ms`、`score`、**xyz 与 rx/ry/rz**（`x_mm`…`rz_rad`，与 HTTP PEM 的 `xyzrxryrz` 一致）
+  - `Pose_Estimation_Model/trt/baseline_results.json`（默认路径：与 `baseline.csv` 同目录、文件名为 `basename(baseline.csv)_results.json`）：完整 pose 快照、`reference_for_trt_compare`（默认取 **最后一次 benchmark 推理**）、`per_run` 逐次记录
 
 该脚本特点：
 
@@ -71,7 +73,8 @@ PEM 并不是纯 CNN，包含：
 - 使用 `preload_default_pem_model` 先做模型预加载；
 - 先执行若干次 warmup（默认 5 次），再进行 benchmark（默认 30 次）；
 - 使用 `time.perf_counter_ns()` 纳秒级计时；
-- CSV 同时写入汇总指标（mean/median/p95/min/max/std）和每次样本时延。
+- CSV 写入汇总指标（mean/median/p95/min/max/std）以及每次样本的时延与六位姿；
+- JSON 写入与 `sam6d_http_service` PEM 字段对齐的 `xyz_mm`、`rotation_euler_zyx_rad`、`xyzrxryrz` 等，供 TensorRT 数值对比。
 
 示例：
 
@@ -92,7 +95,76 @@ python baseline.py \
   --csv_path /home/mui/projects/smt/SAM-6D/SAM-6D/Pose_Estimation_Model/trt/baseline.csv
 ```
 
+可选：
+
+- `--results_json /path/to/baseline_results.json` 指定 JSON 路径（不设则默认生成 `baseline_results.json`）；
+- `--rd_seed`：进程启动时的全局随机种子（默认 `1`），需与 PEM 配置里的 `rd_seed`（如 `config/base.yaml`）保持一致；`baseline_results.json` 的 `inputs.rd_seed` 会记录该值。
+
 建议固定输入与环境变量后再跑，确保 TRT 前后对比公平。
+
+### 3.2 当前 baseline 结论（来自 `trt/baseline.csv`，2026-05-09 一次完整运行）
+
+脚本参数（与 `baseline_results.json` 中 `inputs` 一致）：`warmup_runs=5`，`benchmark_runs=30`，`det_score_thresh=0.0`，`gpus=0`。
+
+时延汇总（单位 ms）：
+
+| 指标 | 数值 |
+|------|------|
+| mean | 473.669504 |
+| median | 467.470258 |
+| p95 | 500.846045 |
+| min | 466.564187 |
+| max | 547.636675 |
+| std | 17.640594 |
+
+样本数：`30` 次。
+
+结论与解读：
+
+- 多数样本落在约 `466~468 ms`；
+- 少数样本明显偏高（例如约 `500~548 ms`），拉高 mean / p95 / std；若需压测结论更稳，可增大 `benchmark_runs` 或排查当时 GPU 抢占、功耗与温度；
+- TRT 前后对比时，建议沿用同一套输入路径与 `--warmup_runs` / `--benchmark_runs`，并同时对比下文 **3.3** 中的位姿参考。
+
+### 3.3 精度对照参考（来自 `trt/baseline_results.json`）
+
+同一次运行生成的 JSON：`schema` 为 `sam6d_pem_baseline_v1`，记录时间（UTC）：`2026-05-09T00:47:08.329473+00:00`。
+
+- **`reference_for_trt_compare`**：本轮取 **第 30 次** benchmark 的最佳检测快照（与 HTTP PEM 约定一致：`xyz_mm` + ZYX 欧拉 `rotation_euler_zyx_rad`，合并为 **`xyzrxryrz`**，单位 `mm_rad`）。
+- 该参考一次典型值为：
+  - `score`: `0.8950991034507751`
+  - `xyzrxryrz`（`x,y,z` mm；`rx,ry,rz` rad）：  
+    `[-40.00130844116211, -46.60285186767578, 423.06646728515625, 2.9259664290113028, -0.31181312340277084, 1.47031892828877]`
+- **`per_run`**：每次 benchmark 的 `latency_ms` 与完整 `pose`。
+
+输入目录说明（JSON 内 `inputs`，便于复现实验）：`output_dir` 指向含 `templates/` 的运行输出；`seg_path` 为该次 PEM 使用的 `detection_ism.json`。
+
+### 3.4 随机种子相关改动与对齐结论（当前仓库）
+
+以下为与本 TRT 指南直接相关的 **代码与结论**，便于做 PyTorch 基线 vs TensorRT 时的预期管理。
+
+**已做的修改（要点）**
+
+1. **`run_warmup_inference_custom.py` → `run_pose_inference()`**  
+   每次推理在原有 `random.seed` / `torch.manual_seed` 之外，增加 **`np.random.seed(cfg.rd_seed)`** 与 **`torch.cuda.manual_seed_all(cfg.rd_seed)`**。  
+   原因：数据管线里大量 **`np.random.choice`**（观测点/模板点采样）以及 **`mesh.sample`** 等依赖 **NumPy 全局 RNG**；仅设 Python `random` 与 `torch` 无法固定这些采样，会导致「同一套输入文件、每次进网络的点集不同」，进而 **`score` 与 `xyzrxryrz` 大幅抖动**。
+
+2. **`run_inference_custom.py`（命令行 PEM）**  
+   与上相同的种子逻辑，保证 CLI 与 API 路径行为一致。
+
+3. **`trt/baseline.py`**  
+   在 `preload_default_pem_model` 之前调用与 PEM 一致的全局设种（`random` / `torch` / `numpy` / `CUDA`），并提供 **`--rd_seed`**（默认 `1`），与 **`config/base.yaml` 的 `rd_seed`** 对齐；`baseline_results.json` 的 `inputs` 中记录 `rd_seed`。
+
+**现象与结论**
+
+| 阶段 | 现象 |
+|------|------|
+| 修正前 | 相同输入下多轮 benchmark，`score` 与六位姿可 **差异很大**（主要源于 **未固定的 NumPy 采样**）。 |
+| 修正后 | 多轮结果 **总体非常接近**；若仍有微小差异，多为 **GPU 浮点累加顺序、cuDNN/自定义 CUDA 算子的非确定性**，属常见数值噪声。 |
+
+**TRT / 基线数值对齐建议**
+
+- **不必追求逐比特完全一致**；对 `xyzrxryrz` 采用 **容差**（mm / rad）更实际。
+- 实践经验：**`score ≥ 0.85`** 的样本上，位姿与置信度 **已基本接近**，适合作为主对照集；低分样本解更模糊，微小数值扰动更容易放大，宜放宽容差或单独分析。
 
 ---
 
@@ -169,12 +241,13 @@ trtexec \
 至少做三类验证：
 
 1. **数值对齐**：PyTorch vs TRT 子模块输出误差；
-2. **任务精度**：最终 `score / R / t` 统计差异；
+2. **任务精度**：最终 `score / R / t`（或与 HTTP 一致的 **`xyzrxryrz`**）统计差异；
 3. **吞吐与时延**：`pose_s` 均值、P95、显存变化。
 
 建议阈值（可按业务调）：
 
 - 位姿偏差在可接受范围内（与当前评估标准一致）；
+- 可优先在 **`score` 较高（例如 ≥ 0.85）** 的样本上收紧对齐要求，低分样本适当放宽（详见 **§3.4**）；
 - 时延收益 >= 20% 才建议上线。
 
 ---
@@ -201,7 +274,7 @@ trtexec \
 
 ## 10. 推荐实施顺序
 
-1. 固定 baseline（当前 warm 方案）  
+1. 固定 baseline（`baseline.csv` + `baseline_results.json`，并与 **`rd_seed`**、输入路径一致，参见 **§3.4**）  
 2. 选 1 个最稳定子模块导出 ONNX  
 3. TRT FP32 对齐  
 4. TRT FP16 性能验证  
@@ -212,7 +285,9 @@ trtexec \
 
 ## 11. 与当前仓库的对应关系
 
-- 热加载主逻辑：`Pose_Estimation_Model/run_warmup_inference_custom.py`
+- 热加载与 PEM API：`Pose_Estimation_Model/run_warmup_inference_custom.py`（含 **`run_pose_inference()`** 内每次推理的随机种子设置）
+- CLI PEM：`Pose_Estimation_Model/run_inference_custom.py`
+- 函数级基线与 pose 记录：`Pose_Estimation_Model/trt/baseline.py`
 - HTTP 入口：`warmup_http_service.py`
 - 当前可直接观察指标：`/infer` 返回中的 `timing.pose_s`
 

@@ -259,6 +259,9 @@ if __name__ == "__main__":
 
     random.seed(cfg.rd_seed)
     torch.manual_seed(cfg.rd_seed)
+    np.random.seed(cfg.rd_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.rd_seed)
 
     # model
     print("=> creating model ...")

@@ -496,6 +496,9 @@ def run_pose_inference(
 
     random.seed(cfg.rd_seed)
     torch.manual_seed(cfg.rd_seed)
+    np.random.seed(cfg.rd_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.rd_seed)
 
     if checkpoint_path is None:
         checkpoint_path = osp.join(BASE_DIR, "checkpoints", "sam-6d-pem-base.pth")
