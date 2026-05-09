@@ -39,6 +39,40 @@ app = FastAPI(title="SAM-6D HTTP Service")
 infer_lock = asyncio.Lock()
 
 
+@app.on_event("startup")
+async def _startup_preload_yolo() -> None:
+    """Optionally preload YOLO weights and run one warmup predict."""
+    yolo_weights = os.environ.get("SAM6D_YOLO_WEIGHTS")
+    if not yolo_weights:
+        print("[warmup_http_service] startup preload YOLO skipped: SAM6D_YOLO_WEIGHTS is not set")
+        return
+
+    weights_path = Path(yolo_weights).expanduser().resolve()
+    if not weights_path.is_file():
+        print(f"[warmup_http_service] startup preload YOLO skipped: weights not found: {weights_path}")
+        return
+
+    try:
+        from yolo_seg_backend import preload_yolo_model
+
+        yolo_imgsz = int(os.environ.get("SAM6D_YOLO_IMGSZ", "640"))
+        yolo_conf = float(os.environ.get("SAM6D_YOLO_CONF", "0.25"))
+        yolo_class_id = int(os.environ.get("SAM6D_YOLO_CLASS_ID", "0"))
+        print(
+            "[warmup_http_service] startup preload YOLO begin: "
+            f"weights={weights_path} imgsz={yolo_imgsz} conf={yolo_conf} class_id={yolo_class_id}"
+        )
+        preload_yolo_model(
+            weights_path=weights_path,
+            imgsz=yolo_imgsz,
+            conf=yolo_conf,
+            class_id=yolo_class_id,
+        )
+        print("[warmup_http_service] startup preload YOLO done")
+    except Exception as exc:
+        print(f"[warmup_http_service] startup preload YOLO failed: {type(exc).__name__}: {exc}")
+
+
 def _env() -> Dict[str, str]:
     env = os.environ.copy()
     env.setdefault("MAMBA_ROOT_PREFIX", "/home/mui/.micromamba")
@@ -374,7 +408,7 @@ async def infer(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", default=8000, type=int)
+    parser.add_argument("--port", default=8001, type=int)
     args = parser.parse_args()
 
     import uvicorn

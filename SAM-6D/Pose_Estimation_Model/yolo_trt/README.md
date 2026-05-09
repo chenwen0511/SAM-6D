@@ -1,3 +1,49 @@
+# YOLO 分割优化记录（当前已完成）
+
+当前只记录已经落地并验证有效的优化，不展开未实施方案。
+
+## 已完成优化点
+
+前置过程（YOLO 分割）已从约 **164ms** 优化到约 **10ms**（本次实测 `yolo_s=0.008888s`，约 `8.9ms`）。
+
+主要优化点：
+
+1. 注释掉两个 `_draw_overlay` 画图保存过程（主要耗时点）
+   - `vis_yolo_seg.png`
+   - `vis_ism.png`
+
+2. 权重文件由 `.pt` 转为 `.engine` 并用于推理
+   - 说明：当前分割模型较小，单看模型前向速度优势不明显；
+   - 主要收益来自服务端链路开销下降（配合第 1 点效果更明显）。
+
+## 实测调用命令
+
+```bash
+curl -X POST "http://127.0.0.1:8001/infer" \
+  -F "rgb=@/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/rgb.png" \
+  -F "depth=@/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/depth.png" \
+  -F "camera=@/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/camera.json" \
+  -F "seg_backend=yolo_seg" \
+  -F "yolo_conf=0.25" \
+  -F "yolo_imgsz=640" \
+  -F "yolo_class_id=0" \
+  -F "det_score_thresh=0.0"
+```
+
+## 返回关键时延（本次）
+
+- `yolo_s`: `0.008888s`（约 `8.9ms`）
+- `pose_s`: `0.606515s`
+- `pipeline_s`: `0.615689s`
+- `upload_s`: `0.001106s`
+- `total_s`: `0.616795s`
+
+对比说明：相较此前 warm 记录中 `yolo_s ≈ 0.1618s`，YOLO 分割阶段耗时显著下降。
+
+## 备注
+
+- 当前记录聚焦时延优化，不展开其它未定方案。
+- 本次返回 `score` 偏低（约 `0.0051`），上线前仍需做精度回归（`score`、`xyzrxryrz`、业务容差）。
 # YOLO 分割 · TensorRT 推理（RTX 4090）
 
 权重示例：
@@ -40,16 +86,7 @@ nvidia-smi -L
 - onnxsim：`0.4.36`
 - onnxruntime-gpu：`1.19.2`
 
-### 0.0.1 可选：清理旧包（卸载）
 
-若环境里历史版本较多，建议先清理再安装，避免混装冲突：
-
-```bash
-python -m pip uninstall -y ultralytics tensorrt tensorrt-cu11 tensorrt-cu12 tensorrt-cu13 onnx onnxsim onnxruntime-gpu
-python -m pip cache purge
-```
-
-> 注意：卸载会影响当前环境的推理能力。建议先导出 `pip freeze > freeze_backup.txt`，或在新环境操作。
 
 ### 0.1 报错 `ModuleNotFoundError: No module named 'tensorrt'`
 
@@ -82,7 +119,7 @@ python -c "import tensorrt as trt; print(trt.__version__)"
 ```
 
 
-**5）只想先绕开「export 阶段」的 TensorRT Python：** 可用 **§2**：Ultralytics 只导出 **`best.onnx`**（一般不需要 `tensorrt`），再用 NVIDIA Tar 包里的 **`trtexec`** 生成 **`best.engine`**。注意：**Ultralytics 用 `YOLO('best.engine')` 做推理时，多数环境仍需要装好 Python 版 TensorRT**；若长期完全不装，需改用自有 C++/runtime 加载引擎。
+
 
 ### 0.2 `max_workspace_size` 报错的最小修复版本（实测）
 
@@ -106,41 +143,6 @@ yolo export model=best.pt format=engine imgsz=640 half=True device=0 workspace=8
 - Engine generation completed in ~205s，`best.engine` 约 `9.1 MB`
 
 建议：若你当前仍是 `8.0.135`，优先先升到 **`8.1.46`** 复测；若仍有兼容问题再升级到更高 8.x。
-
-### 0.3 备用路径：`trtexec` / TRT8.6
-
-若日志类似：
-
-`IBuilderConfig object has no attribute max_workspace_size'`
-
-原因：**TensorRT 10** 已移除该字段；**Ultralytics 8.0.x** 等旧版本仍按 TensorRT 8 API 写死，二者不兼容。
-
-**路径 A（推荐，立刻可用）：** 你已导出 **`best.onnx`** 时，直接用 **`trtexec`**（随 TensorRT 安装，需在 `PATH`）生成引擎，**不必**再走失败的 Python builder：
-
-```bash
-cd /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/yolo_runs/tray_seg/weights
-
-# TensorRT 10：workspace 用 memPoolSize（MiB）；按需调整数值
-trtexec \
-  --onnx=best.onnx \
-  --saveEngine=best.engine \
-  --fp16 \
-  --memPoolSize=workspace:8192 \
-  --verbose
-```
-
-成功后：`yolo predict model=best.engine ...` 或 `SAM6D_YOLO_WEIGHTS=.../best.engine`。
-
-**路径 B：** **升级 Ultralytics** 到支持 TensorRT 10 的版本后再执行 **`yolo export ... format=engine`**（可先从 `8.1.46` 起测）：
-
-```bash
-python -m pip install -U ultralytics
-yolo export model=best.pt format=engine imgsz=640 half=True device=0 workspace=8
-```
-
-升级后请 regression：`predict`、与你 SAM-6D YOLO 分段流水线是否仍兼容。
-
-**路径 C：** 安装 **TensorRT 8.6.x** 一类仍提供 `max_workspace_size` 的旧 Python 绑定（与当前驱动/CUDA 是否兼容需自行核对），一般不如路径 A/B 省事。
 
 ---
 
@@ -245,85 +247,94 @@ HTTP 调用时在服务端保证上述环境变量（或与代码里传入的 `y
 
 相对同一环境下的 **`best.pt`**：**GPU 核心推理**一般由 TensorRT 加速；分割还有 **mask 解码与缩放**，仍在 Ultralytics pipeline 中完成，整体仍有明显提升，具体以你在 **640×480** 图上实测耗时为准（建议 warmup 后循环上百帧取平均）。
 
----
+### 1.7 `pef.py`：`predict` 耗时对比（实测，2026-05-09）
 
-## 2. 方式 B：ONNX → TensorRT（`trtexec`，便于接 C++/PyBind）
+脚本：`Pose_Estimation_Model/yolo_trt/pef.py`。测量 **`YOLO(..., task="segment").predict(...)`** 整段耗时（前后 `torch.cuda.synchronize()`），**不包含** 一次性 `yolo export` 建引擎时间。
 
-### 2.1 导出 ONNX
+环境与权重：
 
-```bash
-cd /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/yolo_runs/tray_seg/weights
+- GPU：RTX 4090，`device=0`
+- `ultralytics==8.1.46`，`torch 2.0.0+cu117`
+- `best.pt` / `best.engine`：`user_data/yolo_runs/tray_seg/weights/`
+- 测试图：`user_data/outputs/20260507_103518_e7ebc86f/inputs/rgb.png`
+- 参数：`warmup=10`，`runs=50`，`imgsz=640`，`conf=0.25`
 
-export CUDA_VISIBLE_DEVICES=0
-
-yolo export model=best.pt format=onnx imgsz=640 opset=17 simplify=True dynamic=False
-```
-
-得到 `best.onnx`（分割模型会有多个输出：检测框 / mask 系数 / proto 等，具体以 Netron 打开 ONNX 为准）。
-
-### 2.2 构建 FP16 Engine（固定 batch=1、固定输入 640×640 示例）
+命令：
 
 ```bash
-cd /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/yolo_runs/tray_seg/weights
+cd /home/mui/projects/smt/SAM-6D/SAM-6D/Pose_Estimation_Model/yolo_trt
 
-# 根据 ONNX 实际输入名/shape 调整；YOLOv8 分割常见输入名为 images，形状 1x3x640x640
-trtexec \
-  --onnx=best.onnx \
-  --saveEngine=best_seg_fp16.engine \
-  --fp16 \
-  --workspace=8192 \
-  --memPoolSize=workspace:8192 \
-  --verbose
-
-# 若 trtexec 报 shape/profile 错误，用下面命令查看 ONNX 输入输出：
-# polygraphy inspect model best.onnx
-# 或 onnxruntime / Netron 手动核对后再补 --minShapes/--optShapes/--maxShapes
+python pef.py \
+  --pt /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/yolo_runs/tray_seg/weights/best.pt \
+  --engine /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/yolo_runs/tray_seg/weights/best.engine \
+  --rgb /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/rgb.png \
+  --warmup 10 \
+  --runs 50 \
+  --imgsz 640 \
+  --conf 0.25 \
+  --device 0 \
+  --baseline-s 0.16
 ```
 
-动态 batch 时需增加 profile（示例，**名称与维度必须与你的 ONNX 一致**）：
+结果摘要（`pef.py` 终端输出）：
+
+| 模型 | mean (ms) | median (ms) | min / max (ms) | std (ms) |
+|------|-----------|-------------|----------------|----------|
+| `best.pt` | 7.438 | 7.471 | 7.260 / 7.759 | 0.122 |
+| `best.engine` | 6.102 | 6.125 | 5.842 / 6.763 | 0.142 |
+
+- **TensorRT engine 相对 PT**：按均值约 **1.22×**（`pt/engine`，engine 更快）。
+- **`--baseline-s 0.16`**（160 ms）：脚本用于对照 HTTP 里记录的 **`yolo_s` 量级**；本实测 **`predict` 仅约 6～8 ms**，说明服务端 **`yolo_s≈0.16 s`** 除 GPU 推理外，还包括 Python 调度、I/O、后处理等与 **`pef.py` 窄口径计时** 不一致的部分，**不宜直接把 160 ms 当作单次 `predict` 纯算力耗时**。
+
+---
+
+
+## 5. 服务端优化实测（2026-05-09）
+
+本节记录 `warmup_http_service.py + yolo_seg_backend.py` 链路的优化改动与 `/infer` 实测结果。
+
+### 5.1 改动点（已落地）
+
+1. **分割任务显式指定**
+   - `YOLO(..., task="segment")`
+   - `model.predict(..., task="segment")`
+   - 目的：避免 `.engine` 被自动误判为 detect，导致 `KeyError` / `masks` 异常。
+
+2. **服务启动即预加载 + warmup**
+   - `warmup_http_service.py` 启动阶段读取 `SAM6D_YOLO_WEIGHTS`。
+   - 调用 `preload_yolo_model()` 预加载模型到 cache，并执行一次 dummy warmup。
+   - 目的：降低首请求抖动。
+
+3. **后处理耗时优化**
+   - `_mask_to_rle` 改为 `pycocotools.mask.encode`（替代手写 Python 循环）。
+   - 固定当前链路分辨率为 `640x480`（注意 `cv2.resize` 参数顺序为 `(width, height)`）。
+   - 当前代码中默认不保存 YOLO 可视化图（减少 I/O）。
+
+4. **耗时可观测性**
+   - 增加 `_load_model` / `model.predict` / `load+predict` 的毫秒级打印。
+
+### 5.2 调用命令（实测）
 
 ```bash
-trtexec \
-  --onnx=best.onnx \
-  --saveEngine=best_seg_fp16_dynamic.engine \
-  --fp16 \
-  --minShapes=images:1x3x640x640 \
-  --optShapes=images:1x3x640x640 \
-  --maxShapes=images:4x3x640x640 \
-  --workspace=8192
+curl -X POST "http://127.0.0.1:8001/infer" \
+  -F "rgb=@/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/rgb.png" \
+  -F "depth=@/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/depth.png" \
+  -F "camera=@/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/camera.json" \
+  -F "seg_backend=yolo_seg" \
+  -F "yolo_conf=0.25" \
+  -F "yolo_imgsz=640" \
+  -F "yolo_class_id=0" \
+  -F "det_score_thresh=0.0"
 ```
 
----
+### 5.3 本次返回时延
 
-## 3. PyBind11 + TensorRT（自定义加速路径）
+- `yolo_s`: `0.008888s`（约 `8.9ms`）
+- `pose_s`: `0.606515s`
+- `pipeline_s`: `0.615689s`
+- `upload_s`: `0.001106s`
+- `total_s`: `0.616795s`
 
-引擎文件：`best.engine` 或 `best_seg_fp16.engine`（由 §1 或 §2 生成）。
+相较此前 warm 记录中 `yolo_s ≈ 0.1618s`，YOLO 分割阶段耗时显著下降。
 
-典型步骤（无统一单行命令，需在工程里 CMake）：
-
-1. C++ 侧：`nvinfer1::IRuntime` → `deserializeCudaEngine` → `createExecutionContext`，绑定输入输出 buffer，`enqueueV3`（或对应 API）。
-2. Python 侧：用 **pybind11** 暴露例如 `infer(float_ptr)` / `infer_numpy(np.ndarray)`。
-3. CMake 大致依赖：**TensorRT `include` + `libnvinfer.so`**、**CUDA**、**pybind11**，编译为 `.so`，`import your_module`。
-
-官方可参考 TensorRT samples（`sampleOnnxMNIST` 等）改写成模块；PyBind 绑定范例见 [pybind11 docs](https://pybind11.readthedocs.io)。
-
-分割后处理（mask = protos @ coeffs + sigmoid + resize）若仍在 Python 里做，通常足够快；瓶颈多在 backbone + neck 的 GPU 推理。
-
----
-
-## 4. 与当前 SAM-6D 仓库的衔接
-
-HTTP / pipeline 里 YOLO 入口见：`SAM-6D/yolo_seg_backend.py`，当前为 **`Ultralytics YOLO(best.pt)`**。换成 TensorRT 需要：
-
-- 要么 **`YOLO("best.engine")`**（优先验证）；
-- 要么改为加载你的 **PyBind 扩展**，在扩展内跑 engine，并在 Python 侧拼出与现逻辑一致的 mask/bbox（再写 `detection_ism.json`）。
-
----
-
-## 5. 4090 常见问题
-
-| 现象 | 处理 |
-|------|------|
-| `yolo export ... engine` 失败 | 确认 `pip show tensorrt` 与 CUDA 版本匹配；或用 §2 ONNX + `trtexec`。 |
-| `trtexec` 找不到输入名 | `polygraphy inspect model best.onnx`，按输出改 `--shapes`。 |
-| FP16 精度下降 | 先用 `--fp32` 建引擎对比 mask；再决定是否 FP16。 |
+> 备注：本次返回 `score` 偏低（约 `0.0051`）。上线前需继续做精度回归（`score`、`xyzrxryrz`、业务容差），避免仅看时延。

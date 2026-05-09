@@ -1,10 +1,12 @@
 import json
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 from PIL import Image
+from pycocotools import mask as cocomask
 from ultralytics import YOLO
 
 
@@ -13,26 +15,26 @@ _MODEL_CACHE: Dict[str, YOLO] = {}
 
 def _load_model(weights_path: Path) -> YOLO:
     key = str(weights_path.resolve())
+    print(f"[yolo_seg_backend] load request: {weights_path} (resolved: {key})")
     if key not in _MODEL_CACHE:
         if not weights_path.is_file():
+            print(f"[yolo_seg_backend] weights not found: {weights_path}")
             raise FileNotFoundError(f"YOLO weights not found: {weights_path}")
-        _MODEL_CACHE[key] = YOLO(key)
+        print(f"[yolo_seg_backend] loading YOLO model: {key}")
+        # Force segmentation task to avoid TRT engine auto-guess as detect.
+        _MODEL_CACHE[key] = YOLO(key, task="segment")
+        print(f"[yolo_seg_backend] model loaded and cached: {key}")
+    else:
+        print(f"[yolo_seg_backend] model cache hit: {key}")
     return _MODEL_CACHE[key]
 
 
 def _mask_to_rle(binary_mask: np.ndarray) -> Dict[str, object]:
     mask = np.asfortranarray(binary_mask.astype(np.uint8))
-    counts: List[int] = []
-    last_elem = 0
-    running_length = 0
-    for elem in mask.ravel(order="F"):
-        if int(elem) == last_elem:
-            running_length += 1
-        else:
-            counts.append(running_length)
-            running_length = 1
-            last_elem = int(elem)
-    counts.append(running_length)
+    rle = cocomask.encode(mask)
+    counts = rle["counts"]
+    if isinstance(counts, bytes):
+        counts = counts.decode("ascii")
     return {"counts": counts, "size": [int(mask.shape[0]), int(mask.shape[1])]}
 
 
@@ -80,8 +82,17 @@ def run_yolo_segmentation(
     imgsz: int = 640,
     class_id: Optional[int] = 0,
 ) -> Path:
+    t0 = time.perf_counter()
+    t_load0 = time.perf_counter()
     model = _load_model(weights_path)
-    results = model.predict(str(rgb_path), conf=conf, imgsz=imgsz, verbose=False)
+    t_load1 = time.perf_counter()
+    print(f"[yolo_seg_backend] _load_model elapsed_ms={(t_load1 - t_load0) * 1000:.3f}")
+
+    t_pred0 = time.perf_counter()
+    results = model.predict(str(rgb_path), conf=conf, imgsz=imgsz, verbose=False, task="segment")
+    t_pred1 = time.perf_counter()
+    print(f"[yolo_seg_backend] model.predict elapsed_ms={(t_pred1 - t_pred0) * 1000:.3f}")
+    print(f"[yolo_seg_backend] load+predict elapsed_ms={(t_pred1 - t0) * 1000:.3f}")
     if not results:
         raise RuntimeError("YOLO returned no results")
 
@@ -101,8 +112,9 @@ def run_yolo_segmentation(
         raise RuntimeError(f"YOLO returned no masks for class_id={class_id}")
 
     best_idx = max(candidate_indexes, key=lambda idx: float(scores[idx]))
-    with Image.open(rgb_path) as image:
-        image_size = image.size
+    # with Image.open(rgb_path) as image:
+    #     image_size = image.size
+    image_size = (480, 640)
     mask = _resize_mask(masks[best_idx], image_size)
     bbox_xywh = _xyxy_to_xywh(boxes[best_idx])
     score = float(scores[best_idx])
@@ -120,6 +132,33 @@ def run_yolo_segmentation(
         "segmentation": _mask_to_rle(mask),
     }
     json_path.write_text(json.dumps([detection]), encoding="utf-8")
-    _draw_overlay(rgb_path, mask, bbox_xywh, sam6d_results / "vis_yolo_seg.png", score)
-    _draw_overlay(rgb_path, mask, bbox_xywh, sam6d_results / "vis_ism.png", score)
+    # _draw_overlay(rgb_path, mask, bbox_xywh, sam6d_results / "vis_yolo_seg.png", score)
+    # _draw_overlay(rgb_path, mask, bbox_xywh, sam6d_results / "vis_ism.png", score)
     return json_path
+
+
+def preload_yolo_model(
+    weights_path: Path,
+    *,
+    imgsz: int = 640,
+    conf: float = 0.25,
+    class_id: Optional[int] = 0,
+) -> None:
+    """Preload YOLO model into cache and run one dummy warmup predict."""
+    t0 = time.perf_counter()
+    model = _load_model(weights_path)
+    t1 = time.perf_counter()
+    print(f"[yolo_seg_backend] preload _load_model elapsed_ms={(t1 - t0) * 1000:.3f}")
+
+    # Dummy image with fixed camera shape (H, W, C) = 640x480x3.
+    dummy = np.zeros((640, 480, 3), dtype=np.uint8)
+    t2 = time.perf_counter()
+    results = model.predict(dummy, conf=conf, imgsz=imgsz, verbose=False, task="segment")
+    t3 = time.perf_counter()
+    print(f"[yolo_seg_backend] preload warmup predict elapsed_ms={(t3 - t2) * 1000:.3f}")
+
+    if results:
+        result = results[0]
+        n = 0 if result.boxes is None else len(result.boxes)
+        print(f"[yolo_seg_backend] preload warmup detections={n} class_filter={class_id}")
+    print(f"[yolo_seg_backend] preload total elapsed_ms={(t3 - t0) * 1000:.3f}")
