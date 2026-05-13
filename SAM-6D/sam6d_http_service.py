@@ -22,7 +22,7 @@ class InferTiming(TypedDict, total=False):
     pipeline_s: float
     total_s: float
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -233,7 +233,8 @@ def _run_sam6d_pipeline(
             class_id=yolo_class_id,
         )
         timing["yolo_s"] = time.perf_counter() - t_seg
-        pem_det_score_thresh = 0.0
+        # PEM 显存随 batch（实例数）暴涨；勿写死 0.0，否则所有 YOLO 框进 PEM 易在 coarse 阶段 OOM。
+        pem_det_score_thresh = float(det_score_thresh)
     else:
         raise RuntimeError("seg_backend must be 'sam6d_ism' or 'yolo_seg'")
 
@@ -310,20 +311,22 @@ async def infer(
     rgb: UploadFile = File(...),
     depth: UploadFile = File(...),
     camera: UploadFile = File(...),
-    segmentor_model: str = "sam",
-    seg_backend: Optional[str] = None,
-    yolo_weights: Optional[str] = None,
-    yolo_conf: float = 0.25,
-    yolo_imgsz: int = 640,
-    yolo_class_id: int = 0,
-    det_score_thresh: float = 0.3,
+    segmentor_model: str = Form(default="sam"),
+    seg_backend: Optional[str] = Form(default=None),
+    yolo_weights: Optional[str] = Form(default=None),
+    yolo_conf: float = Form(default=0.25),
+    yolo_imgsz: int = Form(default=640),
+    yolo_class_id: int = Form(default=0),
+    det_score_thresh: float = Form(default=0.3),
 ) -> Dict[str, Any]:
     if segmentor_model not in {"sam", "fastsam"}:
         raise HTTPException(status_code=400, detail="segmentor_model must be 'sam' or 'fastsam'")
 
     cad_path = _cad_path()
-    selected_backend = seg_backend or os.environ.get("SAM6D_SEG_BACKEND", "sam6d_ism")
-    selected_yolo_weights_value = yolo_weights or os.environ.get("SAM6D_YOLO_WEIGHTS")
+    seg_backend_clean = seg_backend.strip() if seg_backend else None
+    selected_backend = seg_backend_clean or os.environ.get("SAM6D_SEG_BACKEND", "sam6d_ism")
+    yolo_weights_clean = yolo_weights.strip() if yolo_weights else None
+    selected_yolo_weights_value = yolo_weights_clean or os.environ.get("SAM6D_YOLO_WEIGHTS")
     selected_yolo_weights = (
         Path(selected_yolo_weights_value).expanduser().resolve() if selected_yolo_weights_value else None
     )
