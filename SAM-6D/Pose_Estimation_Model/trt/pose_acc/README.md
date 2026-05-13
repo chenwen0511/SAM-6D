@@ -52,11 +52,105 @@
 
 端到端时延与 pose 数值基线：`trt/baseline.py`（`baseline.csv` / `*_results.json`）。随机种子与 **`score` / `xyzrxryrz`** 稳定性见 `trt/README.md`。模板缓存不改变数值路径（与同一 `rd_seed` + 同一模板目录 + 同一 `test_dataset` 关键字段下的冷读结果应对齐）。
 
+
 ---
 
-## 4. 变更日志（手动维护）
+## 4. `warmup_http_service` 启动与 `/infer` 实测（2026-05-13）
 
-| 日期 | 说明 |
-|------|------|
-| （待填） | §1.1 冷读模板分项快照 |
-| （待填） | §1.2 启动预加载模板 GPU 缓存后 `/infer` 分项快照 |
+### 4.1 服务启动（shell）
+
+```bash
+export SAM6D_CAD_PATH=/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/models/tray_180mm_centered_mesh_v2.ply
+export SAM6D_OUTPUT_ROOT=/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs
+export CUDA_VISIBLE_DEVICES=0
+cd /home/mui/projects/smt/SAM-6D/SAM-6D
+python warmup_http_service.py --host 0.0.0.0 --port 8001
+```
+
+说明：若需 **YOLO 启动预加载**、**PEM 模板 GPU 预加载**，可另行设置 `SAM6D_YOLO_WEIGHTS`、`SAM6D_PEM_PRELOAD_TEMPLATES` 等（见 `warmup_http_service.py` 与 §1.2）。本次记录以用户实际 export 为准。
+
+### 4.2 请求（`yolo_seg` + TensorRT engine）
+
+```bash
+curl -X POST "http://127.0.0.1:8001/infer" \
+  -F "rgb=@/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/rgb.png" \
+  -F "depth=@/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/depth.png" \
+  -F "camera=@/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260507_103518_e7ebc86f/inputs/camera.json" \
+  -F "seg_backend=yolo_seg" \
+  -F "yolo_weights=/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/yolo_runs/tray_seg/weights/best.engine" \
+  -F "yolo_conf=0.25" \
+  -F "yolo_imgsz=640" \
+  -F "yolo_class_id=0" \
+  -F "det_score_thresh=0.00"
+```
+
+**注意**：`det_score_thresh=0.00` 会让 **所有** 超过几何过滤的 YOLO 实例进入 PEM，显存与耗时随实例数上升；生产环境建议 **≥0.25** 或与 `yolo_conf` 配合使用。
+
+### 5.4 响应摘要（HTTP 200）
+
+| 字段 | 值 |
+|------|-----|
+| `score` | `0.12119197100400925` |
+| `xyz_mm` | `[-61.437, -131.235, 606.296]`（约 mm，浮点略截断） |
+| `rotation_euler_zyx_rad` | `[2.977, 0.816, 1.273]`（弧度，ZYX） |
+| `result_dir` | `/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/outputs/20260513_100347_7af98c24` |
+
+分割结果路径字段名仍为历史命名 **`detection_ism_path`**，在 `yolo_seg` 模式下指向本次生成的 **分割 JSON**（与 PEM 的 `detection_pem.json` 不同文件）。
+
+### 4.4 `timing`（秒）
+
+| 键 | 值 (s) | 说明 |
+|----|--------:|------|
+| `upload_s` | 0.000964 | 上传写盘 |
+| `templates_s` | 0.000147 | 模板目录 symlink |
+| `ism_s` | `null` | 未走 SAM ISM 子进程 |
+| `yolo_s` | 0.017548 | YOLO 分割（含 TRT 路径） |
+| `pose_s` | 0.244655 | 整段 `run_pose_inference`（含 `get_templates` / ViT / `forward` 等） |
+| `pipeline_s` | 0.262351 | `templates_s + yolo_s + pose_s` |
+| `total_s` | 0.263315 | `upload_s + pipeline_s` |
+
+### 4.5 服务端控制台分项（与 HTTP `timing` 对照）
+
+同一路径下，**`yolo_seg_backend` 打印**与 **`run_pose_inference` 内 `_log`**（需 `verbose=True`，例如环境变量 `SAM6D_PEM_VERBOSE=true`，且 HTTP 服务里已对 PEM 打开 verbose）典型一行请求如下。
+
+**YOLO（TensorRT engine，缓存命中）**
+
+| 日志 | 耗时 (ms) |
+|------|-----------:|
+| `_load_model elapsed_ms` | 0.054 |
+| `model.predict elapsed_ms` | 16.104 |
+| `load+predict elapsed_ms` | 16.164 |
+
+**PEM（模板 GPU 缓存命中、无 `visualize` 行）**
+
+| 日志 | 耗时 (ms) | 备注 |
+|------|-----------:|------|
+| `get_templates elapsed_ms` | 0.003 | 含 `get_templates (gpu cache hit, skipped disk reload)` |
+| `template feature_extraction.get_obj_feats elapsed_ms` | 119.058 | ViT 模板特征 |
+| `get_test_data elapsed_ms` | 89.603 | 观测 + CAD 等 |
+| `model.forward elapsed_ms` | 34.591 | coarse / fine 等 |
+| **上述 PEM 四段相加** | **≈243.3** | 与 **`pose_s`≈0.245 s** 同量级（另含建模型分支日志、`saving results` 等未打点部分） |
+
+原始日志片段（便于检索）：
+
+```
+[yolo_seg_backend] load request: /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/yolo_runs/tray_seg/weights/best.engine (resolved: /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/yolo_runs/tray_seg/weights/best.engine)
+[yolo_seg_backend] model cache hit: /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/yolo_runs/tray_seg/weights/best.engine
+[yolo_seg_backend] _load_model elapsed_ms=0.054
+[yolo_seg_backend] model.predict elapsed_ms=16.104
+[yolo_seg_backend] load+predict elapsed_ms=16.164
+set CUDA_VISIBLE_DEVICES as 0
+=> creating model ...
+=> extracting templates ...
+=> get_templates (gpu cache hit, skipped disk reload)
+=> get_templates elapsed_ms=0.003
+=> template feature_extraction.get_obj_feats elapsed_ms=119.058
+=> loading input data ...
+=> get_test_data elapsed_ms=89.603
+=> running model ...
+=> model.forward elapsed_ms=34.591
+=> saving results ...
+INFO:     127.0.0.1:38326 - "POST /infer HTTP/1.1" 200 OK
+```
+
+**小结**：**§5.4** 的 `timing.yolo_s` / `timing.pose_s` 可与 **§5.5** 表中 **~16 ms**、**PEM 四段 ~243 ms** 对照；与 §1.1 旧表不宜逐行等同（无可视化、缓存与随机种子等差异）。PEM 详细日志依赖 **`SAM6D_PEM_VERBOSE`**（及 `warmup_http_service` 内传入 `run_pose_inference` 的 `verbose`）。
