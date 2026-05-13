@@ -155,6 +155,54 @@ INFO:     127.0.0.1:38326 - "POST /infer HTTP/1.1" 200 OK
 
 **小结**：**§4.4** 的 `timing.yolo_s` / `timing.pose_s` 可与 **§4.5** 表中 **~16 ms**、**PEM 四段 ~243 ms** 对照；与 §1.1 旧表不宜逐行等同（无可视化、缓存与随机种子等差异）。PEM 详细日志依赖 **`SAM6D_PEM_VERBOSE`**（及 `warmup_http_service` 内传入 `run_pose_inference` 的 `verbose`）。
 
+### 4.6 `/infer` 再测：开启 PEM `rgb_net` TensorRT 后（2026-05-13）
+
+以下日志来自同一 **`warmup_http_service` + `yolo_seg` + `best.engine`** 路径；**`template feature_extraction.get_obj_feats elapsed_ms` 由约 119 ms 降至约 34 ms**，与在进程环境中设置 **`SAM6D_PEM_RGB_TRT_ENGINE=checkpoints/pem_rgb_net_b1_224_fp16.engine`**（**`ViTEncoder`** 走 **`PemRgbNetTrt`**，见 **`vit_acc.md` §9**）一致。**YOLO `model.predict` 本行约 75 ms**，与 **§4.5 的 ~16 ms** 可差数倍，多为 **Ultralytics 首次/偶发慢路径、GPU 竞争、输入尺寸与实例数** 等导致，**不宜单独与 PEM 子模块加速混为一谈**；对比 PEM 时请固定 **`get_obj_feats` / `forward`** 前后文。
+
+**分项表（本组日志）**
+
+| 模块 | 日志 | 耗时 (ms) |
+|------|------|-----------:|
+| YOLO | `_load_model elapsed_ms` | 0.062 |
+| YOLO | `model.predict elapsed_ms` | 74.931 |
+| YOLO | `load+predict elapsed_ms` | 74.999 |
+| PEM | `get_templates elapsed_ms` | 0.004 |
+| PEM | `template feature_extraction.get_obj_feats elapsed_ms` | **34.192** |
+| PEM | `get_test_data elapsed_ms` | 89.565 |
+| PEM | `model.forward elapsed_ms` | 35.867 |
+| PEM 四段相加 | — | **≈159.6** |
+
+**与 §4.5 同口径对照（量级）**
+
+| 项 | §4.5（PyTorch rgb） | §4.6（本组，含 PEM rgb TRT） |
+|----|---------------------|------------------------------|
+| `get_obj_feats` | **119.058** | **34.192** |
+| `get_test_data` | 89.603 | 89.565 |
+| `model.forward` | 34.591 | 35.867 |
+| YOLO `predict` | 16.104 | 74.931 |
+
+原始日志片段：
+
+```
+[yolo_seg_backend] load request: /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/yolo_runs/tray_seg/weights/best.engine (resolved: /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/yolo_runs/tray_seg/weights/best.engine)
+[yolo_seg_backend] model cache hit: /home/mui/projects/smt/SAM-6D/SAM-6D/user_data/yolo_runs/tray_seg/weights/best.engine
+[yolo_seg_backend] _load_model elapsed_ms=0.062
+[yolo_seg_backend] model.predict elapsed_ms=74.931
+[yolo_seg_backend] load+predict elapsed_ms=74.999
+set CUDA_VISIBLE_DEVICES as 0
+=> creating model ...
+=> extracting templates ...
+=> get_templates (gpu cache hit, skipped disk reload)
+=> get_templates elapsed_ms=0.004
+=> template feature_extraction.get_obj_feats elapsed_ms=34.192
+=> loading input data ...
+=> get_test_data elapsed_ms=89.565
+=> running model ...
+=> model.forward elapsed_ms=35.867
+=> saving results ...
+INFO:     127.0.0.1:50434 - "POST /infer HTTP/1.1" 200 OK
+```
+
 ---
 
 ## 5. YOLO 分割 `best.engine` 因 TensorRT 环境对齐重新导出（2026-05-13）
@@ -201,4 +249,4 @@ HTTP 服务请将 **`SAM6D_YOLO_WEIGHTS`** 或 curl 的 **`yolo_weights`** 指�
 
 ### 5.4 与 PEM 记录的关系
 
-§4 的 **`yolo_s` / `yolo_seg_backend` 耗时** 基于 **Ultralytics + TensorRT engine**；**升级 / 重装 TensorRT 后务必按本节重导 YOLO engine**，否则可能出现加载失败或静默数值漂移。PEM 侧 ViT TRT 规划见 [`vit_acc.md`](vit_acc.md)。
+§4 的 **`yolo_s` / `yolo_seg_backend` 耗时** 基于 **Ultralytics + TensorRT engine**；**升级 / 重装 TensorRT 后务必按本节重导 YOLO engine**，否则可能出现加载失败或静默数值漂移。PEM 侧 **`rgb_net` TensorRT** 接入与数值验证见 [`vit_acc.md`](vit_acc.md)；**`/infer` 上 PEM ViT 段加速前后对照**见 **§4.5 / §4.6**。

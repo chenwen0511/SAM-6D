@@ -238,20 +238,21 @@ trtexec --onnx=checkpoints/pem_rgb_net_b1_224_sim.onnx \
 
 ### 9.1 代码入口（必须改动的唯一语义点）
 
-`ViTEncoder` 里 **`get_img_feats`** 当前实现为：
+`ViTEncoder` 里 **`get_img_feats`** 实现为（启用 **`SAM6D_PEM_RGB_TRT_ENGINE`** 且加载成功时走 TRT）：
 
-```167:168:SAM-6D/Pose_Estimation_Model/model/feature_extraction.py
+```197:202:SAM-6D/Pose_Estimation_Model/model/feature_extraction.py
     def get_img_feats(self, img, choose):
-        return get_chosen_pixel_feats(self.rgb_net(img)[0], choose)
+        if self._pem_rgb_trt is not None:
+            dense = self._pem_rgb_trt.forward_dense(img)
+        else:
+            dense = self.rgb_net(img)[0]
+        return get_chosen_pixel_feats(dense, choose)
 ```
 
 接入 TRT 时，把 **`self.rgb_net(img)[0]`** 换成 **与之一张量语义相同的 `dense_feat`**（形状见下节），**仍调用** `get_chosen_pixel_feats(dense_feat, choose)`。  
 **不要**动 `get_chosen_pixel_feats` / `sample_pts_feats` / `forward` 里点云与模板几何逻辑；**不要**要求 TRT 直接输出「采样后点特征」，那是 PyTorch 里 `gather` 的事。
 
-可选组织方式：
-
-- **A（侵入小）**：在 **`get_img_feats`** 内：若环境变量 **`SAM6D_PEM_RGB_TRT_ENGINE`** 指向合法 `.engine` 文件，则走 TRT；否则走 **`self.rgb_net(img)[0]`**（便于 A/B 与回滚）。
-- **B（更清晰）**：新建小模块（例如 `trt/pem_rgb_trt.py`）封装 **`deserialize_cuda_engine` + `IExecutionContext` + 绑定 `images`/`dense_feat`**，`ViTEncoder` 只持有一个可选的 wrapper 实例。
+**仓库实现（与下文环境变量一致）**：**`trt/pem_rgb_trt.py`** 中 **`PemRgbNetTrt`**；**`model/feature_extraction.py`** 的 **`ViTEncoder`** 在 **`SAM6D_PEM_RGB_TRT_ENGINE`** 指向合法 `.engine` 时构造该 runner，并在 **`get_img_feats`** 中调用 **`forward_dense`**，否则仍走 **`self.rgb_net(img)[0]`**。（原设计备选 **A** 的环境变量开关 + **B** 的独立 TRT 模块已合并为该实现。）
 
 ### 9.2 与数据预处理对齐（否则数值全错）
 
@@ -290,11 +291,66 @@ TRT 子图是在 **上述分布的 `img`** 上导出的，接入时 **禁止** �
 5. **少拷贝优化**：若 TRT 输出缓冲区直接是 **`torch.cuda.FloatTensor` 的 storage**（或 DLPack 互操作），可避免 **`dense_feat` 全量回 CPU 再上传**，与附录 E 中「D2H 限吞吐」的分析一致；**`get_chosen_pixel_feats` 只需 GPU 上索引**。  
 6. **开关与回滚**：未设置环境变量或文件不存在时，走 **`self.rgb_net(img)[0]`**，保证未部署 TRT 的环境行为不变。
 
+**启用示例**（在 `Pose_Estimation_Model` 目录下启动推理或 HTTP 前导出，路径可为绝对路径或相对 **仓库内 `Pose_Estimation_Model/`** 根目录）：
+
+```bash
+export SAM6D_PEM_RGB_TRT_ENGINE=checkpoints/pem_rgb_net_b1_224_fp16.engine
+# 或: export SAM6D_PEM_RGB_TRT_ENGINE=/abs/path/to/pem_rgb_net_b1_224_fp16.engine
+```
+
 ### 9.6 精度验收（上线前建议必做）
 
-1. 固定同一 **`img`**（模板或观测裁剪后 **`1×3×224×224`**），比较 **`self.rgb_net(img)[0]`** 与 TRT **`dense_feat`** 的 **`abs().max()`** / 相对误差。  
+1. 固定同一 **`img`**（模板或观测裁剪后 **`1×3×224×224`**），比较 **`self.rgb_net(img)[0]`** 与 TRT **`dense_feat`** 的 **`abs().max()`** / 相对误差。仓库脚本：**`trt/pose_acc/accurate_val.py`**（随机 ImageNet 分布输入 + **`get_chosen_pixel_feats`** 对照）。  
 2. 再对两路 **`dense`** 分别做 **`get_chosen_pixel_feats(..., choose)`**，比较 gather 后特征。  
 3. 可选：全链路 **`run_pose_inference`** 对比 **`detection_pem.json`** / **`xyzrxryrz`**（与 `trt/README.md`、**`pose_acc/README.md` §3** 思路一致）。
+
+#### 9.6.1 一次实测记录（`accurate_val.py`，2026-05-13）
+
+以下为用户在 **Ubuntu / `sam6d`** 下运行 **`accurate_val.py`** 的终端摘录整理；**PyTorch** 为 **`sam-6d-pem-base.pth`** 加载后的 **`rgb_net`**，**TensorRT** 为 **`checkpoints/pem_rgb_net_b1_224_fp16.engine`**，输入为脚本内 **随机 `U(0,1)` + ImageNet Normalize**（与 **`rgb_transform`** 同分布），**未**设置 **`SAM6D_PEM_RGB_TRT_ENGINE`**（脚本会先解析 engine 路径再 `pop`，避免 `ViTEncoder` 双路径干扰）。
+
+```bash
+python trt/pose_acc/accurate_val.py --engine checkpoints/pem_rgb_net_b1_224_fp16.engine
+```
+
+| 指标 | 数值 |
+|------|------|
+| 脚本参数 | **`samples=8`**，**`seed=1`**，**`n_choose=2048`** |
+| dense **max_abs**（8 次样本中最差） | **0.0312712** |
+| dense **mean_abs**（8 次平均） | **0.00166531** |
+| dense **rel_rms / \|pt\|_mean**（8 次平均） | **0.00401689** |
+| **`get_chosen_pixel_feats`** **max_abs**（8 次中最差） | **0.0267191** |
+| **B=3**（`forward_dense` 批处理 vs PyTorch 逐张 cat）：dense **max_abs** | **0.037426** |
+| **B=3**：dense **mean_abs** | **0.00162636** |
+
+各样本明细（dense / gather **max_abs**）：约 **0.026～0.031** / **0.021～0.027** 量级，与 **FP16 engine + I/O fp32** 及算子融合下的数值差一致；若业务要求更严，可收紧 **`--fail-if-max-abs-above`** 或改用 **FP32 engine** 再测。
+
+TensorRT 曾打印：**`Using default stream in enqueueV3()`** 可能影响尾延迟与同步次数；与 **PyTorch vs TRT 张量误差**无直接关系。若需压测吞吐，可在 **`pem_rgb_trt.py`** 中改为显式 **非默认 CUDA stream**（后续优化项）。
+
+#### 9.6.2 结论解读（上述数值「算不算好」、是否「符合要求」）
+
+**这些指标在说什么**
+
+- **dense `max_abs` ~0.03**：全图 **`256×224×224`** 上，单通道单像素与 PyTorch 的绝对差最坏约 **3×10⁻²**；**`mean_abs` ~1.7×10⁻³** 表示整体平均偏差更小。
+- **`rel_rms / |pt|_mean` ~0.004**：相对 PyTorch 激活平均幅度，约 **0.4%** 量级（与脚本定义一致，便于跨模型粗比）。
+- **`get_chosen_pixel_feats` 最差 `max_abs` ~0.027**：经 **`gather`** 后的模板/观测点特征误差与 dense 同量级，未见「仅 dense 好、采样后爆掉」的形态。
+- **B=3 略差于 B=1**：多实例循环 TRT 时最坏 **~0.037**，仍在同一数量级，与 §9.4 批处理方式一致。
+
+**与 FP16 TensorRT 预期是否一致**
+
+在 **FP16 engine（层内低精度）+ I/O fp32**、以及 ONNX 与 PyTorch 注意力实现路径不完全相同的前提下，**L∞ 落在约 10⁻² 量级**在工程上很常见；当前 **~3×10⁻²** 属于 **偏紧、可接受** 区间，**不是**「特征已明显不可用」的信号。
+
+**是否「符合要求」——取决于你们签字的指标**
+
+| 若产品/验收要求是…… | 与当前结果的关系 |
+|----------------------|------------------|
+| **位姿或现场指标**与 PyTorch 路径 **足够接近**（允许轻微 FP16 漂移） | **仅凭 dense 误差不能盖章**；需 **端到端** 对照（同一输入、关/开 **`SAM6D_PEM_RGB_TRT_ENGINE`**，比 **`detection_pem.json` / `xyzrxryrz` / score** 等）。**通过则**可认为 **rgb TRT 路径在业务上符合要求**。 |
+| **中间特征与 PyTorch 几乎逐元素一致**（如要求 **`max_abs < 1e-3`**） | 当前 **~0.03** **不满足**；应 **重导 FP32 engine** 或 **收紧导出/算子** 后再测。 |
+
+**建议动作（简短）**
+
+1. 以 **业务指标** 做最终裁定；**`accurate_val`** 用于 **子模块 sanity check**，替代不了位姿签字。  
+2. 若需更贴近线上：把输入从随机张量换成 **真实 crop**（与 **`rgb_transform`** 一致）再跑 **`accurate_val`** 或扩展脚本。  
+3. 若 CI 需要门槛：使用 **`--fail-if-max-abs-above`**，阈值由 **FP16 可接受上界** 与 **端到端回归** 共同商定。
 
 ### 9.7 与 HTTP 服务的关系
 
@@ -313,5 +369,7 @@ TRT 子图是在 **上述分布的 `img`** 上导出的，接入时 **禁止** �
 ## 10. 文档与脚本索引
 
 - 导出 ONNX / SDPA 说明：**本文 §4**；脚本 **`Pose_Estimation_Model/export_pem_rgb_net_onnx.py`**。  
+- **PEM rgb TensorRT 运行库**：**`trt/pem_rgb_trt.py`**（**`PemRgbNetTrt`**，环境变量 **`SAM6D_PEM_RGB_TRT_ENGINE`**）。  
+- **PyTorch vs TRT dense 数值脚本**：**`trt/pose_acc/accurate_val.py`**。  
 - PEM 推理数据流与 HTTP：**`trt/PEM_INFER.md`**、**`pose_acc/README.md`**。  
 - 本目录 **`a.log` 解析**：**本文附录**。

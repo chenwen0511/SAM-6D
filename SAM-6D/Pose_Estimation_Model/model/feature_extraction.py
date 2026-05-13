@@ -1,4 +1,5 @@
 import os
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -12,6 +13,18 @@ from model_utils import (
     sample_pts_feats
 )
 
+
+def _resolve_pem_rgb_trt_engine_path(raw: str) -> str:
+    try:
+        from trt.pem_rgb_trt import resolve_engine_path
+
+        return resolve_engine_path(raw)
+    except Exception:
+        raw = raw.strip().strip('"').strip("'")
+        if os.path.isfile(raw):
+            return os.path.abspath(raw)
+        pem_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        return os.path.abspath(os.path.join(pem_root, raw))
 
 
 class ViT(timm.models.vision_transformer.VisionTransformer):
@@ -124,6 +137,23 @@ class ViTEncoder(nn.Module):
         super(ViTEncoder, self).__init__()
         self.npoint = npoint
         self.rgb_net = ViT_AE(cfg)
+        self._pem_rgb_trt = None
+        trt_raw = os.environ.get("SAM6D_PEM_RGB_TRT_ENGINE", "").strip()
+        if trt_raw:
+            trt_path = _resolve_pem_rgb_trt_engine_path(trt_raw)
+            if os.path.isfile(trt_path):
+                try:
+                    from trt.pem_rgb_trt import PemRgbNetTrt
+
+                    self._pem_rgb_trt = PemRgbNetTrt(trt_path)
+                    print(f"=> ViTEncoder: PEM rgb_net dense via TensorRT ({trt_path})")
+                except Exception as exc:
+                    print(f"=> ViTEncoder: TensorRT rgb_net disabled, fallback to PyTorch ({exc})")
+            else:
+                print(
+                    f"=> ViTEncoder: SAM6D_PEM_RGB_TRT_ENGINE is not a file ({trt_path}); "
+                    "using PyTorch rgb_net"
+                )
 
     def forward(self, end_points):
         rgb = end_points['rgb']
@@ -165,7 +195,11 @@ class ViTEncoder(nn.Module):
         return dense_pm, dense_fm, dense_po, dense_fo, radius
 
     def get_img_feats(self, img, choose):
-        return get_chosen_pixel_feats(self.rgb_net(img)[0], choose)
+        if self._pem_rgb_trt is not None:
+            dense = self._pem_rgb_trt.forward_dense(img)
+        else:
+            dense = self.rgb_net(img)[0]
+        return get_chosen_pixel_feats(dense, choose)
 
     def get_obj_feats(self, tem_rgb_list, tem_pts_list, tem_choose_list, npoint=None):
         if npoint is None:
