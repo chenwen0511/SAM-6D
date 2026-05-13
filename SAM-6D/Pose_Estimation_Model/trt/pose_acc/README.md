@@ -2,7 +2,7 @@
 
 本目录用于归档 **Pose Estimation Model（PEM）** 在推理链路优化过程中的阶段性结论：分项耗时、精度对照思路、以及与上层 `trt/` 基线工作的衔接。
 
-更完整的 TensorRT 与基线脚本说明见上一级：[`../README.md`](../README.md)。
+更完整的 TensorRT 与基线脚本说明见上一级：[`../README.md`](../README.md)。**YOLO `best.engine` 在升级 TensorRT 后需重导** 见 **§5**；系统级 TRT / `trtexec` 安装备忘见 [`trtexec_install.md`](trtexec_install.md)。
 
 ---
 
@@ -67,7 +67,7 @@ cd /home/mui/projects/smt/SAM-6D/SAM-6D
 python warmup_http_service.py --host 0.0.0.0 --port 8001
 ```
 
-说明：若需 **YOLO 启动预加载**、**PEM 模板 GPU 预加载**，可另行设置 `SAM6D_YOLO_WEIGHTS`、`SAM6D_PEM_PRELOAD_TEMPLATES` 等（见 `warmup_http_service.py` 与 §1.2）。本次记录以用户实际 export 为准。
+说明：若需 **YOLO 启动预加载**、**PEM 模板 GPU 预加载**，可另行设置 `SAM6D_YOLO_WEIGHTS`、`SAM6D_PEM_PRELOAD_TEMPLATES` 等（见 `warmup_http_service.py` 与 §1.2）。本次记录以用户实际环境为准。
 
 ### 4.2 请求（`yolo_seg` + TensorRT engine）
 
@@ -86,7 +86,7 @@ curl -X POST "http://127.0.0.1:8001/infer" \
 
 **注意**：`det_score_thresh=0.00` 会让 **所有** 超过几何过滤的 YOLO 实例进入 PEM，显存与耗时随实例数上升；生产环境建议 **≥0.25** 或与 `yolo_conf` 配合使用。
 
-### 5.4 响应摘要（HTTP 200）
+### 4.3 响应摘要（HTTP 200）
 
 | 字段 | 值 |
 |------|-----|
@@ -153,4 +153,52 @@ set CUDA_VISIBLE_DEVICES as 0
 INFO:     127.0.0.1:38326 - "POST /infer HTTP/1.1" 200 OK
 ```
 
-**小结**：**§5.4** 的 `timing.yolo_s` / `timing.pose_s` 可与 **§5.5** 表中 **~16 ms**、**PEM 四段 ~243 ms** 对照；与 §1.1 旧表不宜逐行等同（无可视化、缓存与随机种子等差异）。PEM 详细日志依赖 **`SAM6D_PEM_VERBOSE`**（及 `warmup_http_service` 内传入 `run_pose_inference` 的 `verbose`）。
+**小结**：**§4.4** 的 `timing.yolo_s` / `timing.pose_s` 可与 **§4.5** 表中 **~16 ms**、**PEM 四段 ~243 ms** 对照；与 §1.1 旧表不宜逐行等同（无可视化、缓存与随机种子等差异）。PEM 详细日志依赖 **`SAM6D_PEM_VERBOSE`**（及 `warmup_http_service` 内传入 `run_pose_inference` 的 `verbose`）。
+
+---
+
+## 5. YOLO 分割 `best.engine` 因 TensorRT 环境对齐重新导出（2026-05-13）
+
+在完成本目录 [`trtexec_install.md`](trtexec_install.md) 所述的 **系统级 TensorRT / Python `tensorrt` 版本对齐**（日志中出现 **`TensorRT 10.16.1.11`**）后，**旧版 `best.engine` 与当前运行时 TensorRT 可能不兼容**，需用 **`best.pt` 重新 `yolo export`** 生成新 engine，服务与 CLI 再指向新文件。
+
+### 5.1 备份与导出命令（已在本机验证）
+
+工作目录：`user_data/yolo_runs/tray_seg/weights`
+
+```bash
+mv best.engine best.engine.bak
+# 将路径换为你本机 best.pt 所在目录
+yolo export model=/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/yolo_runs/tray_seg/weights/best.pt \
+  format=engine half=True workspace=8
+```
+
+说明：日志中 **`TensorRT requires GPU export, automatically assigning device=0`** 为 Ultralytics 提示，无需再手写 `device=0`（可加 `device=0` 显式指定）。
+
+### 5.2 本次导出关键信息摘要
+
+| 项 | 值 |
+|----|-----|
+| Ultralytics | `8.1.46` |
+| PyTorch | `2.0.0+cu117` |
+| GPU | `NVIDIA GeForce RTX 4090` |
+| TensorRT（导出时） | **`10.16.1.11`** |
+| 输入 | `images`，`(1, 3, 640, 640)` FP32（engine 为 **FP16**） |
+| 输出 | `output0` `(1, 37, 8400)`，`output1` `(1, 32, 160, 160)` |
+| ONNX | `best.onnx`，约 `12.6 MB`，`onnxsim` 简化成功 |
+| Engine | `best.engine`，约 **`8.2 MB`** |
+| Builder 耗时 | **约 172 s**（`Engine generation completed in 171.72 seconds`） |
+| 总导出耗时 | 日志约 **173.7 s** |
+
+### 5.3 导出后自检（分割任务）
+
+```bash
+yolo predict task=segment \
+  model=/home/mui/projects/smt/SAM-6D/SAM-6D/user_data/yolo_runs/tray_seg/weights/best.engine \
+  imgsz=640 half
+```
+
+HTTP 服务请将 **`SAM6D_YOLO_WEIGHTS`** 或 curl 的 **`yolo_weights`** 指向新生成的 **`best.engine`**；若进程内已缓存旧模型，**需重启服务** 后再压测。
+
+### 5.4 与 PEM 记录的关系
+
+§4 的 **`yolo_s` / `yolo_seg_backend` 耗时** 基于 **Ultralytics + TensorRT engine**；**升级 / 重装 TensorRT 后务必按本节重导 YOLO engine**，否则可能出现加载失败或静默数值漂移。PEM 侧 ViT TRT 规划见 [`vit_acc.md`](vit_acc.md)。
