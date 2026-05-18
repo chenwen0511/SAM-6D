@@ -654,6 +654,7 @@ def run_pose_inference(
                 "No valid instances for PEM after filtering (seg scores / depth / geometry). "
                 "Lower det_score_thresh or fix segmentation."
             )
+        _log(f"=> PEM instances (seg filter + geometry): {ninstance}")
 
         _log("=> running model ...")
         with torch.no_grad():
@@ -688,14 +689,13 @@ def run_pose_inference(
         _log("=> visualizating ...")
         vis_path = osp.join(f"{cfg.output_dir}/sam6d_results", "vis_pem.png")
         t_vis0 = time.perf_counter()
-        valid_masks = pose_scores_np == pose_scores_np.max()
-        K = input_data["K"].detach().cpu().numpy()[valid_masks]
+        K_all = input_data["K"].detach().cpu().numpy()
         vis_img = visualize(
             img,
-            pred_rot[valid_masks],
-            pred_trans[valid_masks],
+            pred_rot,
+            pred_trans,
             model_points * 1000,
-            K,
+            K_all,
             vis_path,
         )
         vis_img.save(vis_path)

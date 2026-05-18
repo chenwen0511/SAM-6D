@@ -18,6 +18,7 @@ class InferTiming(TypedDict, total=False):
     templates_s: float
     ism_s: Optional[float]
     yolo_s: Optional[float]
+    sam3_s: Optional[float]
     pose_s: float
     pipeline_s: float
     total_s: float
@@ -135,19 +136,36 @@ def _link_templates(source: Path, output_dir: Path) -> None:
     target.symlink_to(source, target_is_directory=True)
 
 
-def _best_detection(result_path: Path) -> Dict[str, Any]:
+def _load_pem_detections(result_path: Path) -> List[Dict[str, Any]]:
     if not result_path.is_file():
         raise RuntimeError(f"missing result file: {result_path}")
-
     with result_path.open("r", encoding="utf-8") as f:
         detections = json.load(f)
     if not detections:
         raise RuntimeError("SAM-6D returned no detections")
+    if not isinstance(detections, list):
+        raise RuntimeError(f"expected detection list in {result_path}")
+    return detections
 
-    best = max(detections, key=lambda item: float(item.get("score", 0.0)))
+
+def _best_detection(result_path: Path) -> Dict[str, Any]:
+    best = max(_load_pem_detections(result_path), key=lambda item: float(item.get("score", 0.0)))
     if "t" not in best:
         raise RuntimeError("best detection does not contain translation field 't'")
     return best
+
+
+def _detection_pose_fields(det: Dict[str, Any]) -> Dict[str, Any]:
+    xyz_mm = det["t"]
+    rotation_matrix = det.get("R")
+    euler_zyx_rad = _rotation_matrix_to_euler_zyx(rotation_matrix) if rotation_matrix else None
+    return {
+        "score": float(det.get("score", 0.0)),
+        "xyz_mm": xyz_mm,
+        "rotation_euler_zyx_rad": euler_zyx_rad,
+        "xyzrxryrz": list(xyz_mm) + list(euler_zyx_rad) if euler_zyx_rad else None,
+        "bbox": det.get("bbox"),
+    }
 
 
 def _rotation_matrix_to_euler_zyx(rotation: List[List[float]]) -> List[float]:
@@ -181,10 +199,14 @@ def _run_sam6d_pipeline(
     yolo_imgsz: int,
     yolo_class_id: int,
     det_score_thresh: float,
+    sam3_prompt: Optional[str] = None,
+    sam3_threshold: Optional[float] = None,
+    sam3_mask_threshold: Optional[float] = None,
 ) -> Dict[str, Any]:
     timing: InferTiming = {
         "ism_s": None,
         "yolo_s": None,
+        "sam3_s": None,
     }
 
     t_templates = time.perf_counter()
@@ -235,8 +257,22 @@ def _run_sam6d_pipeline(
         timing["yolo_s"] = time.perf_counter() - t_seg
         # PEM 显存随 batch（实例数）暴涨；勿写死 0.0，否则所有 YOLO 框进 PEM 易在 coarse 阶段 OOM。
         pem_det_score_thresh = float(det_score_thresh)
+    elif seg_backend == "sam3":
+        from sam3_seg_backend import run_sam3_segmentation
+
+        t_seg = time.perf_counter()
+        seg_path = run_sam3_segmentation(
+            rgb_path=rgb_path,
+            output_dir=output_dir,
+            prompt=sam3_prompt,
+            threshold=sam3_threshold,
+            mask_threshold=sam3_mask_threshold,
+        )
+        timing["sam3_s"] = time.perf_counter() - t_seg
+        # SAM3 may write multiple instances in detection_ism.json; PEM uses all above det_score_thresh.
+        pem_det_score_thresh = float(det_score_thresh)
     else:
-        raise RuntimeError("seg_backend must be 'sam6d_ism' or 'yolo_seg'")
+        raise RuntimeError("seg_backend must be 'sam6d_ism', 'yolo_seg', or 'sam3'")
 
     t_pose = time.perf_counter()
     _run_command(
@@ -263,22 +299,28 @@ def _run_sam6d_pipeline(
     )
     timing["pose_s"] = time.perf_counter() - t_pose
 
-    seg_used = timing.get("ism_s") if seg_backend == "sam6d_ism" else timing.get("yolo_s")
+    if seg_backend == "sam6d_ism":
+        seg_used = timing.get("ism_s")
+    elif seg_backend == "yolo_seg":
+        seg_used = timing.get("yolo_s")
+    else:
+        seg_used = timing.get("sam3_s")
     timing["pipeline_s"] = timing["templates_s"] + float(seg_used or 0.0) + timing["pose_s"]
 
     result_path = output_dir / "sam6d_results/detection_pem.json"
-    best = _best_detection(result_path)
-    xyz_mm = best["t"]
-    rotation_matrix = best.get("R")
-    euler_zyx_rad = _rotation_matrix_to_euler_zyx(rotation_matrix) if rotation_matrix else None
+    pem_detections = _load_pem_detections(result_path)
+    instances = [_detection_pose_fields(det) for det in pem_detections]
+    best_pose = max(instances, key=lambda item: float(item["score"]))
     return {
-        "score": float(best.get("score", 0.0)),
-        "xyz_mm": xyz_mm,
-        "rotation_euler_zyx_rad": euler_zyx_rad,
+        "score": best_pose["score"],
+        "xyz_mm": best_pose["xyz_mm"],
+        "rotation_euler_zyx_rad": best_pose["rotation_euler_zyx_rad"],
         "rotation_order": "zyx",
         "pose_convention": "xyz is camera-frame translation in mm; rx, ry, rz are ZYX Euler angles in radians.",
-        "xyzrxryrz": list(xyz_mm) + list(euler_zyx_rad) if euler_zyx_rad else None,
+        "xyzrxryrz": best_pose["xyzrxryrz"],
         "xyzrxryrz_unit": "mm_rad",
+        "num_instances": len(instances),
+        "instances": instances,
         "result_dir": str(output_dir),
         "detection_ism_path": str(seg_path),
         "detection_pem_path": str(result_path),
@@ -303,6 +345,17 @@ def health() -> Dict[str, Any]:
         "default_seg_backend": os.environ.get("SAM6D_SEG_BACKEND", "sam6d_ism"),
         "yolo_weights": yolo_weights,
         "yolo_weights_exists": bool(yolo_weights and Path(yolo_weights).expanduser().is_file()),
+        "sam3_root": os.environ.get("SAM6D_SAM3_ROOT", "/home/ubuntu/stephen/01-code/sam3"),
+        "sam3_python": os.environ.get(
+            "SAM6D_SAM3_PYTHON", "/home/ubuntu/miniconda3/envs/sam3/bin/python"
+        ),
+        "sam3_infer_script": os.environ.get(
+            "SAM6D_SAM3_INFER_SCRIPT",
+            f"{os.environ.get('SAM6D_SAM3_ROOT', '/home/ubuntu/stephen/01-code/sam3')}/scripts/infer.py",
+        ),
+        "sam3_prompt_default": os.environ.get("SAM6D_SAM3_PROMPT", "white plate"),
+        "sam3_threshold_default": os.environ.get("SAM6D_SAM3_THRESHOLD", "0.41"),
+        "sam3_mask_threshold_default": os.environ.get("SAM6D_SAM3_MASK_THRESHOLD", "0.50"),
     }
 
 
@@ -318,6 +371,9 @@ async def infer(
     yolo_imgsz: int = Form(default=640),
     yolo_class_id: int = Form(default=0),
     det_score_thresh: float = Form(default=0.3),
+    sam3_prompt: Optional[str] = Form(default=None),
+    sam3_threshold: Optional[float] = Form(default=None),
+    sam3_mask_threshold: Optional[float] = Form(default=None),
 ) -> Dict[str, Any]:
     if segmentor_model not in {"sam", "fastsam"}:
         raise HTTPException(status_code=400, detail="segmentor_model must be 'sam' or 'fastsam'")
@@ -368,6 +424,9 @@ async def infer(
                 yolo_imgsz=yolo_imgsz,
                 yolo_class_id=yolo_class_id,
                 det_score_thresh=det_score_thresh,
+                sam3_prompt=sam3_prompt.strip() if sam3_prompt else None,
+                sam3_threshold=sam3_threshold,
+                sam3_mask_threshold=sam3_mask_threshold,
             )
             timing = payload["timing"]
             timing["upload_s"] = upload_s
