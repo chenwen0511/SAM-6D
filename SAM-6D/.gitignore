@@ -1,0 +1,38 @@
+# Model weights & local assets
+checkpoints/
+user_data/
+
+# Runtime inference outputs
+service_outputs/
+service_outputs_test/
+
+# Downloaded / generated datasets & renders
+Data/
+Render/
+
+# Default YOLO weights
+yolov8n-seg.pt
+yolov8n.pt
+
+# Python build artifacts
+**/build/
+*.egg-info/
+__pycache__/
+*.so
+
+# Logs
+*.log
+
+# Benchmark outputs
+**/baseline.csv
+**/baseline_results.json
+
+# Large exported model files
+*.engine
+*.onnx
+
+# Backup / temp files
+*.old
+
+# Generated images (demo outputs, renders, vis)
+*.png
