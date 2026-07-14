@@ -213,4 +213,34 @@ def get_bop_image(inst, bbox, img_size, mask=None):
     return rgb
 
 
+def pem_sphere_crop_mask(cloud, choose, radius, mask_crop_shape):
+    """Spherical outlier crop for PEM observed points.
+
+    Env vars:
+      SAM6D_PEM_SPHERE_SCALE (default 3.0): multiplier on CAD bounding radius.
+      SAM6D_PEM_SPHERE_MIN_POINTS (default 4): minimum points after crop.
+      SAM6D_PEM_THIN_STRIP_ASPECT (default 4.0): mask h/w above this uses extent-based threshold.
+      SAM6D_PEM_THIN_STRIP_EXTENT_PAD (default 1.05): keep full cloud extent for thin strips.
+    """
+    cloud = np.asarray(cloud, dtype=np.float64)
+    choose = np.asarray(choose)
+    center = np.mean(cloud, axis=0)
+    centered = cloud - center[None, :]
+    dists = np.linalg.norm(centered, axis=1)
+
+    scale = float(os.environ.get("SAM6D_PEM_SPHERE_SCALE", "3.0"))
+    threshold = float(radius) * scale
+    min_points = int(os.environ.get("SAM6D_PEM_SPHERE_MIN_POINTS", "4"))
+
+    crop_h, crop_w = int(mask_crop_shape[0]), int(mask_crop_shape[1])
+    aspect = max(crop_h, crop_w) / max(min(crop_h, crop_w), 1)
+    thin_aspect = float(os.environ.get("SAM6D_PEM_THIN_STRIP_ASPECT", "4.0"))
+    if aspect >= thin_aspect and dists.size > 0:
+        extent_pad = float(os.environ.get("SAM6D_PEM_THIN_STRIP_EXTENT_PAD", "1.05"))
+        threshold = max(threshold, float(np.max(dists)) * extent_pad)
+
+    flag = dists < threshold
+    if int(np.sum(flag)) < min_points:
+        return None, None
+    return cloud[flag], choose[flag]
 

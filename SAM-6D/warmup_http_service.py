@@ -19,6 +19,7 @@ class InferTiming(TypedDict, total=False):
     ism_s: Optional[float]
     yolo_s: Optional[float]
     sam3_s: Optional[float]
+    mask_s: Optional[float]
     pose_s: float
     pipeline_s: float
     total_s: float
@@ -283,11 +284,14 @@ def _run_sam6d_pipeline(
     sam3_prompt: Optional[str] = None,
     sam3_threshold: Optional[float] = None,
     sam3_mask_threshold: Optional[float] = None,
+    mask_path: Optional[Path] = None,
+    mask_score: float = 1.0,
 ) -> Dict[str, Any]:
     timing: InferTiming = {
         "ism_s": None,
         "yolo_s": None,
         "sam3_s": None,
+        "mask_s": None,
     }
 
     t_templates = time.perf_counter()
@@ -352,8 +356,23 @@ def _run_sam6d_pipeline(
         timing["sam3_s"] = time.perf_counter() - t_seg
         # SAM3 may write multiple instances in detection_ism.json; PEM batches all above det_score_thresh.
         pem_det_score_thresh = float(det_score_thresh)
+    elif seg_backend == "user_mask":
+        if mask_path is None:
+            raise RuntimeError("mask file is required when seg_backend=user_mask")
+        from mask_seg_backend import run_user_mask_segmentation
+
+        t_seg = time.perf_counter()
+        seg_path = run_user_mask_segmentation(
+            mask_path=mask_path,
+            depth_path=depth_path,
+            output_dir=output_dir,
+            rgb_path=rgb_path,
+            score=mask_score,
+        )
+        timing["mask_s"] = time.perf_counter() - t_seg
+        pem_det_score_thresh = float(det_score_thresh)
     else:
-        raise RuntimeError("seg_backend must be 'sam6d_ism', 'yolo_seg', or 'sam3'")
+        raise RuntimeError("seg_backend must be 'sam6d_ism', 'yolo_seg', 'sam3', or 'user_mask'")
 
     t_pose = time.perf_counter()
     gpu_ids = os.environ.get("SAM6D_CUDA_VISIBLE_DEVICES", "0")
@@ -376,8 +395,10 @@ def _run_sam6d_pipeline(
         seg_used = timing.get("ism_s")
     elif seg_backend == "yolo_seg":
         seg_used = timing.get("yolo_s")
-    else:
+    elif seg_backend == "sam3":
         seg_used = timing.get("sam3_s")
+    else:
+        seg_used = timing.get("mask_s")
     timing["pipeline_s"] = timing["templates_s"] + float(seg_used or 0.0) + timing["pose_s"]
 
     result_path = output_dir / "sam6d_results/detection_pem.json"
@@ -436,6 +457,7 @@ async def infer(
     rgb: UploadFile = File(...),
     depth: UploadFile = File(...),
     camera: UploadFile = File(...),
+    mask: Optional[UploadFile] = File(None),
     segmentor_model: str = Form(default="sam"),
     seg_backend: Optional[str] = Form(default=None),
     yolo_weights: Optional[str] = Form(default=None),
@@ -446,6 +468,7 @@ async def infer(
     sam3_prompt: Optional[str] = Form(default=None),
     sam3_threshold: Optional[float] = Form(default=None),
     sam3_mask_threshold: Optional[float] = Form(default=None),
+    mask_score: float = Form(default=1.0),
 ) -> Dict[str, Any]:
     if segmentor_model not in {"sam", "fastsam"}:
         raise HTTPException(status_code=400, detail="segmentor_model must be 'sam' or 'fastsam'")
@@ -453,6 +476,13 @@ async def infer(
     cad_path = _cad_path()
     seg_backend_clean = seg_backend.strip() if seg_backend else None
     selected_backend = seg_backend_clean or os.environ.get("SAM6D_SEG_BACKEND", "sam6d_ism")
+    if selected_backend == "user_mask" and mask is None:
+        raise HTTPException(status_code=400, detail="mask file is required when seg_backend=user_mask")
+    if selected_backend != "user_mask" and mask is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="mask file is only accepted when seg_backend=user_mask",
+        )
     yolo_weights_clean = yolo_weights.strip() if yolo_weights else None
     selected_yolo_weights_value = yolo_weights_clean or os.environ.get("SAM6D_YOLO_WEIGHTS")
     selected_yolo_weights = (
@@ -466,11 +496,14 @@ async def infer(
     rgb_path = input_dir / "rgb.png"
     depth_path = input_dir / "depth.png"
     camera_path = input_dir / "camera.json"
+    mask_path = input_dir / "mask.png" if mask is not None else None
 
     t_upload = time.perf_counter()
     await _save_upload(rgb, rgb_path)
     await _save_upload(depth, depth_path)
     await _save_upload(camera, camera_path)
+    if mask is not None:
+        await _save_upload(mask, mask_path)
     upload_s = time.perf_counter() - t_upload
 
     try:
@@ -499,6 +532,8 @@ async def infer(
                 sam3_prompt=sam3_prompt.strip() if sam3_prompt else None,
                 sam3_threshold=sam3_threshold,
                 sam3_mask_threshold=sam3_mask_threshold,
+                mask_path=mask_path,
+                mask_score=mask_score,
             )
             timing = payload["timing"]
             timing["upload_s"] = upload_s

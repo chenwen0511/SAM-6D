@@ -18,13 +18,15 @@ python sam6d_http_service.py --host 0.0.0.0 --port 8000
 |------|------|------|
 | `SAM6D_CAD_PATH` | 是 | CAD 模型路径（`.ply`，单位 mm） |
 | `SAM6D_OUTPUT_ROOT` | 否 | 推理输出根目录，默认 `<repo>/service_outputs` |
-| `SAM6D_SEG_BACKEND` | 否 | 默认分割后端：`sam6d_ism` 或 `yolo_seg`，默认 `sam6d_ism` |
+| `SAM6D_SEG_BACKEND` | 否 | 默认分割后端：`sam6d_ism`、`yolo_seg` 或 `user_mask`，默认 `sam6d_ism` |
 | `SAM6D_YOLO_WEIGHTS` | `yolo_seg` 时 | YOLO 权重路径（`.pt` / `.engine`） |
 | `SAM6D_YOLO_IMGSZ` | 否 | YOLO 输入尺寸，默认 `640` |
 | `SAM6D_YOLO_CONF` | 否 | YOLO 置信度阈值，默认 `0.25` |
 | `SAM6D_YOLO_CLASS_ID` | 否 | YOLO 类别 ID，默认 `0` |
 | `SAM6D_CUDA_VISIBLE_DEVICES` | 否 | GPU 编号 |
 | `SAM6D_ENV_DIR` | 否 | conda 环境路径，默认 `/home/mui/.micromamba/envs/sam6d` |
+| `SAM6D_PEM_SPHERE_SCALE` | 否 | PEM 点云球面裁剪系数，默认 `3.0`（原论文推理为 `1.2`） |
+| `SAM6D_PEM_THIN_STRIP_ASPECT` | 否 | mask 高宽比 ≥ 此值时按点云实际范围保留，默认 `4.0` |
 
 ---
 
@@ -97,7 +99,7 @@ curl -X POST http://127.0.0.1:8004/warmup
 上传 RGB、深度图、相机内参，执行完整 6D 姿态估计 pipeline：
 
 1. 确保 CAD 模板已渲染（BlenderProc，结果缓存）
-2. 实例分割（`sam6d_ism` 或 `yolo_seg`）
+2. 实例分割（`sam6d_ism`、`yolo_seg` 或 `user_mask`）
 3. 姿态估计（PEM）
 4. 返回得分最高的检测结果
 
@@ -112,6 +114,7 @@ curl -X POST http://127.0.0.1:8004/warmup
 | `rgb` | file | RGB 图像（保存为 `rgb.png`） |
 | `depth` | file | 深度图（保存为 `depth.png`，单位 mm） |
 | `camera` | file | 相机参数 JSON（保存为 `camera.json`） |
+| `mask` | file | 二值 mask PNG（**仅** `seg_backend=user_mask` 时必填，保存为 `mask.png`） |
 
 #### `camera.json` 格式
 
@@ -130,12 +133,13 @@ curl -X POST http://127.0.0.1:8004/warmup
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `segmentor_model` | string | `sam` | ISM 分割模型：`sam` 或 `fastsam`（仅 `seg_backend=sam6d_ism` 时生效） |
-| `seg_backend` | string | 环境变量 | 分割后端：`sam6d_ism` 或 `yolo_seg` |
+| `seg_backend` | string | 环境变量 | 分割后端：`sam6d_ism`、`yolo_seg` 或 `user_mask` |
 | `yolo_weights` | string | 环境变量 | YOLO 权重路径（`yolo_seg` 时必填，可覆盖 `SAM6D_YOLO_WEIGHTS`） |
 | `yolo_conf` | float | `0.25` | YOLO 置信度阈值 |
 | `yolo_imgsz` | int | `640` | YOLO 输入尺寸 |
 | `yolo_class_id` | int | `0` | YOLO 目标类别 ID |
 | `det_score_thresh` | float | `0.3` | PEM 检测分数阈值（`yolo_seg` 模式下内部固定为 `0.0`） |
+| `mask_score` | float | `1.0` | 用户 mask 写入 `detection_ism.json` 的 score（仅 `user_mask`） |
 
 ### 响应 `200`
 
@@ -159,6 +163,7 @@ curl -X POST http://127.0.0.1:8004/warmup
     "templates_s": 0.05,
     "ism_s": 12.3,
     "yolo_s": null,
+    "mask_s": null,
     "pose_s": 3.2,
     "pipeline_s": 15.55,
     "total_s": 15.551
@@ -178,13 +183,13 @@ curl -X POST http://127.0.0.1:8004/warmup
 | `detection_ism_path` | 分割结果 JSON（`yolo_seg` 模式下同样写入此字段名） |
 | `detection_pem_path` | PEM 姿态结果 JSON |
 | `vis_ism_path` / `vis_pem_path` | 可视化 PNG 路径 |
-| `timing` | 各阶段耗时（秒）；`ism_s` 或 `yolo_s` 二选一非 null |
+| `timing` | 各阶段耗时（秒）；`ism_s` / `yolo_s` / `mask_s` 三选一非 null |
 
 ### 错误响应
 
 | 状态码 | 场景 |
 |--------|------|
-| `400` | `segmentor_model` 非法、`camera.json` 格式错误 |
+| `400` | `segmentor_model` 非法、`camera.json` 格式错误、`user_mask` 缺少 `mask` 文件 |
 | `500` | `SAM6D_CAD_PATH` 未设置或不存在、pipeline 执行失败、无检测结果 |
 
 ### 示例
@@ -209,6 +214,30 @@ curl -X POST "http://127.0.0.1:8004/infer?seg_backend=yolo_seg&yolo_conf=0.25&yo
 
 若已通过环境变量设置 `SAM6D_YOLO_WEIGHTS`，可省略 query 中的 `yolo_weights`。
 
+#### 用户自带 mask（跳过实例分割）
+
+上传二值 PNG mask（非零像素为前景）。若尺寸与 depth 不一致，服务会按 depth 尺寸 nearest-neighbor 缩放。
+
+```bash
+curl -X POST "http://127.0.0.1:8004/infer?seg_backend=user_mask&mask_score=1.0&det_score_thresh=0.3" \
+  -F "rgb=@/path/to/rgb.png" \
+  -F "depth=@/path/to/depth.png" \
+  -F "camera=@/path/to/camera.json" \
+  -F "mask=@/path/to/mask.png"
+```
+
+`warmup_http_service.py` 同样支持，但 `seg_backend`、`mask_score` 等参数使用 **Form 字段** 而非 query：
+
+```bash
+curl -X POST "http://127.0.0.1:8001/infer" \
+  -F "rgb=@/path/to/rgb.png" \
+  -F "depth=@/path/to/depth.png" \
+  -F "camera=@/path/to/camera.json" \
+  -F "mask=@/path/to/mask.png" \
+  -F "seg_backend=user_mask" \
+  -F "mask_score=1.0"
+```
+
 ---
 
 ## 输出目录结构
@@ -220,7 +249,8 @@ curl -X POST "http://127.0.0.1:8004/infer?seg_backend=yolo_seg&yolo_conf=0.25&yo
 ├── inputs/
 │   ├── rgb.png
 │   ├── depth.png
-│   └── camera.json
+│   ├── camera.json
+│   └── mask.png        # 仅 user_mask 模式
 ├── templates/          → 符号链接到模板缓存
 └── sam6d_results/
     ├── detection_ism.json
@@ -237,12 +267,13 @@ curl -X POST "http://127.0.0.1:8004/infer?seg_backend=yolo_seg&yolo_conf=0.25&yo
 
 ## 分割后端对比
 
-| | `sam6d_ism` | `yolo_seg` |
-|---|-------------|------------|
-| 实现 | 子进程调用 ISM（SAM/FastSAM + DINOv2） | 进程内 YOLO 分割 |
-| 速度 | 较慢 | 较快 |
-| PEM 阈值 | 使用 `det_score_thresh` | 内部固定 `0.0` |
-| 依赖 | ISM checkpoint | `SAM6D_YOLO_WEIGHTS` |
+| | `sam6d_ism` | `yolo_seg` | `user_mask` |
+|---|-------------|------------|-------------|
+| 实现 | 子进程调用 ISM（SAM/FastSAM + DINOv2） | 进程内 YOLO 分割 | 用户上传 mask → `detection_ism.json` |
+| 速度 | 较慢 | 较快 | 最快（跳过分割模型） |
+| PEM 阈值 | 使用 `det_score_thresh` | 内部固定 `0.0` | 使用 `det_score_thresh` |
+| 依赖 | ISM checkpoint | `SAM6D_YOLO_WEIGHTS` | 无额外模型 |
+| 额外输入 | — | — | `mask` PNG 文件 |
 
 ---
 

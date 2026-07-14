@@ -90,6 +90,7 @@ from data_utils import (
     get_bbox,
     get_point_cloud_from_depth,
     get_resize_rgb_choose,
+    pem_sphere_crop_mask,
 )
 from draw_utils import draw_detections
 import pycocotools.mask as cocomask
@@ -101,17 +102,9 @@ rgb_transform = transforms.Compose([transforms.ToTensor(),
 
 def visualize(rgb, pred_rot, pred_trans, model_points, K, save_path):
     img = draw_detections(rgb, pred_rot, pred_trans, model_points, K, color=(255, 0, 0))
-    img = Image.fromarray(np.uint8(img))
-    img.save(save_path)
-    prediction = Image.open(save_path)
-    
-    # concat side by side in PIL
-    rgb = Image.fromarray(np.uint8(rgb))
-    img = np.array(img)
-    concat = Image.new('RGB', (img.shape[1] + prediction.size[0], img.shape[0]))
-    concat.paste(rgb, (0, 0))
-    concat.paste(prediction, (img.shape[1], 0))
-    return concat
+    vis_img = Image.fromarray(np.uint8(img))
+    vis_img.save(save_path)
+    return vis_img
 
 
 def _get_template(path, cfg, tem_index=1):
@@ -212,13 +205,9 @@ def get_test_data(rgb_path, depth_path, cam_path, cad_path, seg_path, det_score_
 
         # pts
         cloud = whole_pts.copy()[y1:y2, x1:x2, :].reshape(-1, 3)[choose, :]
-        center = np.mean(cloud, axis=0)
-        tmp_cloud = cloud - center[None, :]
-        flag = np.linalg.norm(tmp_cloud, axis=1) < radius * 1.2
-        if np.sum(flag) < 4:
+        cloud, choose = pem_sphere_crop_mask(cloud, choose, radius, mask.shape)
+        if cloud is None:
             continue
-        choose = choose[flag]
-        cloud = cloud[flag]
 
         if len(choose) <= cfg.n_sample_observed_point:
             choose_idx = np.random.choice(np.arange(len(choose)), cfg.n_sample_observed_point)

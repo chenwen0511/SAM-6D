@@ -20,6 +20,7 @@ class InferTiming(TypedDict, total=False):
     templates_s: float
     ism_s: Optional[float]
     yolo_s: Optional[float]
+    mask_s: Optional[float]
     pose_s: float
     pipeline_s: float
     total_s: float
@@ -226,10 +227,13 @@ def _run_sam6d_pipeline(
     yolo_imgsz: int,
     yolo_class_id: int,
     det_score_thresh: float,
+    mask_path: Optional[Path] = None,
+    mask_score: float = 1.0,
 ) -> Dict[str, Any]:
     timing: InferTiming = {
         "ism_s": None,
         "yolo_s": None,
+        "mask_s": None,
     }
 
     t_templates = time.perf_counter()
@@ -279,8 +283,23 @@ def _run_sam6d_pipeline(
         )
         timing["yolo_s"] = time.perf_counter() - t_seg
         pem_det_score_thresh = 0.0
+    elif seg_backend == "user_mask":
+        if mask_path is None:
+            raise RuntimeError("mask file is required when seg_backend=user_mask")
+        from mask_seg_backend import run_user_mask_segmentation
+
+        t_seg = time.perf_counter()
+        seg_path = run_user_mask_segmentation(
+            mask_path=mask_path,
+            depth_path=depth_path,
+            output_dir=output_dir,
+            rgb_path=rgb_path,
+            score=mask_score,
+        )
+        timing["mask_s"] = time.perf_counter() - t_seg
+        pem_det_score_thresh = det_score_thresh
     else:
-        raise RuntimeError("seg_backend must be 'sam6d_ism' or 'yolo_seg'")
+        raise RuntimeError("seg_backend must be 'sam6d_ism', 'yolo_seg', or 'user_mask'")
 
     t_pose = time.perf_counter()
     _run_command(
@@ -307,7 +326,12 @@ def _run_sam6d_pipeline(
     )
     timing["pose_s"] = time.perf_counter() - t_pose
 
-    seg_used = timing.get("ism_s") if seg_backend == "sam6d_ism" else timing.get("yolo_s")
+    if seg_backend == "sam6d_ism":
+        seg_used = timing.get("ism_s")
+    elif seg_backend == "yolo_seg":
+        seg_used = timing.get("yolo_s")
+    else:
+        seg_used = timing.get("mask_s")
     timing["pipeline_s"] = timing["templates_s"] + float(seg_used or 0.0) + timing["pose_s"]
 
     result_path = output_dir / "sam6d_results/detection_pem.json"
@@ -366,6 +390,7 @@ async def infer(
     rgb: UploadFile = File(...),
     depth: UploadFile = File(...),
     camera: UploadFile = File(...),
+    mask: Optional[UploadFile] = File(None),
     segmentor_model: str = "sam",
     seg_backend: Optional[str] = None,
     yolo_weights: Optional[str] = None,
@@ -373,12 +398,20 @@ async def infer(
     yolo_imgsz: int = 640,
     yolo_class_id: int = 0,
     det_score_thresh: float = 0.3,
+    mask_score: float = 1.0,
 ) -> Dict[str, Any]:
     if segmentor_model not in {"sam", "fastsam"}:
         raise HTTPException(status_code=400, detail="segmentor_model must be 'sam' or 'fastsam'")
 
     cad_path = _cad_path()
     selected_backend = seg_backend or os.environ.get("SAM6D_SEG_BACKEND", "sam6d_ism")
+    if selected_backend == "user_mask" and mask is None:
+        raise HTTPException(status_code=400, detail="mask file is required when seg_backend=user_mask")
+    if selected_backend != "user_mask" and mask is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="mask file is only accepted when seg_backend=user_mask",
+        )
     selected_yolo_weights_value = yolo_weights or os.environ.get("SAM6D_YOLO_WEIGHTS")
     selected_yolo_weights = (
         Path(selected_yolo_weights_value).expanduser().resolve() if selected_yolo_weights_value else None
@@ -391,11 +424,14 @@ async def infer(
     rgb_path = input_dir / "rgb.png"
     depth_path = input_dir / "depth.png"
     camera_path = input_dir / "camera.json"
+    mask_path = input_dir / "mask.png" if mask is not None else None
 
     t_upload = time.perf_counter()
     await _save_upload(rgb, rgb_path)
     await _save_upload(depth, depth_path)
     await _save_upload(camera, camera_path)
+    if mask is not None:
+        await _save_upload(mask, mask_path)
     upload_s = time.perf_counter() - t_upload
 
     try:
@@ -421,6 +457,8 @@ async def infer(
                 yolo_imgsz=yolo_imgsz,
                 yolo_class_id=yolo_class_id,
                 det_score_thresh=det_score_thresh,
+                mask_path=mask_path,
+                mask_score=mask_score,
             )
             timing = payload["timing"]
             timing["upload_s"] = upload_s
