@@ -252,7 +252,11 @@ def _load_pem_detections(result_path: Path) -> List[Dict[str, Any]]:
     with result_path.open("r", encoding="utf-8") as f:
         detections = json.load(f)
     if not detections:
-        raise RuntimeError("SAM-6D returned no detections")
+        thresh = os.environ.get("SAM6D_PEM_SCORE_THRESH", "0.2")
+        raise RuntimeError(
+            f"SAM-6D returned no detections after pem_score_thresh filter "
+            f"(threshold={thresh}). All pose scores were below the cutoff."
+        )
     if not isinstance(detections, list):
         raise RuntimeError(f"expected detection list in {result_path}")
     return detections
@@ -314,6 +318,7 @@ def _run_sam6d_pipeline(
     sam3_mask_threshold: Optional[float] = None,
     mask_path: Optional[Path] = None,
     mask_score: float = 1.0,
+    pem_score_thresh: Optional[float] = None,
 ) -> Dict[str, Any]:
     timing: InferTiming = {
         "ism_s": None,
@@ -405,6 +410,11 @@ def _run_sam6d_pipeline(
     t_pose = time.perf_counter()
     gpu_ids = os.environ.get("SAM6D_CUDA_VISIBLE_DEVICES", "0")
     pem_verbose = os.environ.get("SAM6D_PEM_VERBOSE", "true").lower() in {"1", "true", "yes"}
+    resolved_pem_score_thresh = (
+        float(pem_score_thresh)
+        if pem_score_thresh is not None
+        else float(os.environ.get("SAM6D_PEM_SCORE_THRESH", "0.2"))
+    )
     run_pose_inference(
         output_dir,
         cad_path,
@@ -413,6 +423,7 @@ def _run_sam6d_pipeline(
         camera_path,
         seg_path,
         det_score_thresh=float(pem_det_score_thresh),
+        pem_score_thresh=resolved_pem_score_thresh,
         gpus=gpu_ids,
         verbose=pem_verbose,
         save_visualization=True,
@@ -444,6 +455,7 @@ def _run_sam6d_pipeline(
         "xyzrxryrz_unit": "mm_rad",
         "num_instances": len(instances),
         "instances": instances,
+        "pem_score_thresh": resolved_pem_score_thresh,
         "result_dir": str(output_dir),
         "detection_ism_path": str(seg_path),
         "detection_pem_path": str(result_path),
@@ -477,6 +489,7 @@ def health() -> Dict[str, Any]:
         "sam3_prompt_default": os.environ.get("SAM6D_SAM3_PROMPT", "white plate"),
         "sam3_threshold_default": os.environ.get("SAM6D_SAM3_THRESHOLD", "0.41"),
         "sam3_mask_threshold_default": os.environ.get("SAM6D_SAM3_MASK_THRESHOLD", "0.50"),
+        "pem_score_thresh_default": os.environ.get("SAM6D_PEM_SCORE_THRESH", "0.2"),
     }
 
 
@@ -493,6 +506,7 @@ async def infer(
     yolo_imgsz: int = Form(default=640),
     yolo_class_id: int = Form(default=0),
     det_score_thresh: float = Form(default=0.3),
+    pem_score_thresh: Optional[float] = Form(default=None),
     sam3_prompt: Optional[str] = Form(default=None),
     sam3_threshold: Optional[float] = Form(default=None),
     sam3_mask_threshold: Optional[float] = Form(default=None),
@@ -557,6 +571,7 @@ async def infer(
                 yolo_imgsz=yolo_imgsz,
                 yolo_class_id=yolo_class_id,
                 det_score_thresh=det_score_thresh,
+                pem_score_thresh=pem_score_thresh,
                 sam3_prompt=sam3_prompt.strip() if sam3_prompt else None,
                 sam3_threshold=sam3_threshold,
                 sam3_mask_threshold=sam3_mask_threshold,

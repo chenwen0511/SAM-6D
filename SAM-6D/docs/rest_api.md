@@ -138,7 +138,8 @@ curl -X POST http://127.0.0.1:8004/warmup
 | `yolo_conf` | float | `0.25` | YOLO 置信度阈值 |
 | `yolo_imgsz` | int | `640` | YOLO 输入尺寸 |
 | `yolo_class_id` | int | `0` | YOLO 目标类别 ID |
-| `det_score_thresh` | float | `0.3` | PEM 检测分数阈值（`yolo_seg` 模式下内部固定为 `0.0`） |
+| `det_score_thresh` | float | `0.3` | 分割进入 PEM 前的检测分数阈值（`yolo_seg` 模式下内部固定为 `0.0`） |
+| `pem_score_thresh` | float | `0.2`（或 `SAM6D_PEM_SCORE_THRESH`） | PEM 位姿置信度下限；低于此值的实例不写入 `detection_pem.json`、不画 `vis_pem`、不出现在 `instances` |
 | `mask_score` | float | `1.0` | 用户 mask 写入 `detection_ism.json` 的 score（仅 `user_mask`） |
 
 ### 响应 `200`
