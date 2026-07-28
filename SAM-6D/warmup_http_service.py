@@ -169,10 +169,38 @@ def _template_cache_dir(cad_path: Path) -> Path:
     return _output_root() / "_template_cache" / cache_key
 
 
+def _expected_template_count() -> int:
+    poses_path = (
+        ROOT_DIR
+        / "Instance_Segmentation_Model"
+        / "utils"
+        / "poses"
+        / "predefined_poses"
+        / "cam_poses_level0.npy"
+    )
+    import numpy as np
+
+    return int(np.load(poses_path).shape[0])
+
+
+def _templates_complete(templates_dir: Path) -> bool:
+    if not templates_dir.is_dir():
+        return False
+    n_view = _expected_template_count()
+    for i in range(n_view):
+        if not (templates_dir / f"rgb_{i}.png").is_file():
+            return False
+        if not (templates_dir / f"mask_{i}.png").is_file():
+            return False
+        if not (templates_dir / f"xyz_{i}.npy").is_file():
+            return False
+    return True
+
+
 def _ensure_templates(cad_path: Path) -> Path:
     cache_dir = _template_cache_dir(cad_path)
     templates_dir = cache_dir / "templates"
-    if (templates_dir / "rgb_0.png").is_file():
+    if _templates_complete(templates_dir):
         return templates_dir
 
     cache_dir.mkdir(parents=True, exist_ok=True)

@@ -34,6 +34,32 @@ def get_norm_info(mesh_path):
     return 1/(2*radius)
 
 
+def purge_invalid_structs():
+    """Drop BlenderProc wrappers whose Blender RNA was deleted by clean_up().
+
+    Otherwise ``render_nocs()`` -> ``UndoAfterExecution`` -> ``get_instances()``
+    crashes with: ReferenceError: StructRNA of type Material has been removed.
+    """
+    from blenderproc.python.types.StructUtility import Struct
+
+    for inst in list(Struct.__refs__):
+        try:
+            _ = inst.blender_obj.name
+        except ReferenceError:
+            Struct.__refs__.discard(inst)
+
+
+def prepare_cad_for_render(cad_path: str) -> str:
+    """Write a colorless mesh copy so load_obj does not create per-face materials."""
+    mesh = trimesh.load(cad_path, force="mesh")
+    if hasattr(mesh, "visual"):
+        mesh.visual = trimesh.visual.ColorVisuals(mesh=mesh)
+    out_path = os.path.join(args.output_dir, "_cad_render_no_color.ply")
+    os.makedirs(args.output_dir, exist_ok=True)
+    mesh.export(out_path)
+    return out_path
+
+
 # load cnos camera pose
 cam_poses = np.load(cnos_cam_fpath)
 
@@ -43,20 +69,32 @@ if args.normalize:
 else:
     scale = 1
 
+cad_path_for_render = prepare_cad_for_render(args.cad_path)
+print(f"[render_custom_templates] using colorless CAD: {cad_path_for_render}")
+
 for idx, cam_pose in enumerate(cam_poses):
     
     bproc.clean_up()
+    purge_invalid_structs()
 
     # load object
-    obj = bproc.loader.load_obj(args.cad_path)[0]
+    obj = bproc.loader.load_obj(cad_path_for_render)[0]
     obj.set_scale([scale, scale, scale])
     obj.set_cp("category_id", 1)
 
-    # assigning material colors to untextured objects
-    if args.colorize:
-        color = [args.base_color, args.base_color, args.base_color, 0.]
-        material = bproc.material.create('obj')
-        material.set_principled_shader_value('Base Color', color)
+    # Always assign a fresh material (tless-style); avoids leftover face-color mats.
+    base = float(args.base_color)
+    if str(args.colorize).lower() in {"1", "true", "yes"}:
+        color = [base, base, base, 0.0]
+    else:
+        color = [0.4, 0.4, 0.4, 0.0]
+    material = bproc.material.create(f"obj_mat_{idx}")
+    material.set_principled_shader_value("Base Color", color)
+    mats = obj.get_materials()
+    if mats:
+        for mat_idx in range(len(mats)):
+            obj.set_material(mat_idx, material)
+    else:
         obj.set_material(0, material)
 
     # convert cnos camera poses to blender camera poses
@@ -76,6 +114,7 @@ for idx, cam_pose in enumerate(cam_poses):
     # render the whole pipeline
     data = bproc.renderer.render()
     # render nocs
+    purge_invalid_structs()
     data.update(bproc.renderer.render_nocs())
     
     # check save folder
